@@ -71,6 +71,11 @@ struct hash<Vulkan::GraphicsPipelineCacheKey> {
 
 namespace Vulkan {
 
+/// SPIR-V modules of the graphics stages, null for unused stages. Shared by the pipelines whose
+/// keys differ only in state the shaders do not see (ShaderReuseCache).
+using GraphicsShaderModules =
+    std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>;
+
 class Device;
 class PipelineStatistics;
 class RenderPassCache;
@@ -115,7 +120,7 @@ class GraphicsPipeline {
 public:
     /// Emits the stages' SPIR-V on a worker; with libraries it also returns each stage's SPIR-V
     /// hash (zero for absent stages).
-    using EmitStagesFunc = std::function<std::array<vk::ShaderModule, NUM_STAGES>(
+    using EmitStagesFunc = std::function<std::shared_ptr<const GraphicsShaderModules>(
         std::array<u128, NUM_STAGES>& spirv_hashes)>;
 
     /// Graphics pipeline libraries (EDEN_NX2_GPL): non-null `library_cache` builds the pipeline
@@ -132,7 +137,7 @@ public:
         GuestDescriptorQueue& guest_descriptor_queue,
         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-        const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
+        const GraphicsPipelineCacheKey& key, std::shared_ptr<const GraphicsShaderModules> modules,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
         EmitStagesFunc emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
@@ -431,7 +436,7 @@ private:
     bool used{};
     size_t source_words{};
 
-    std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    std::shared_ptr<const GraphicsShaderModules> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};

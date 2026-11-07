@@ -368,13 +368,13 @@ GraphicsPipeline::GraphicsPipeline(
     GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
     Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
-    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+    const GraphicsPipelineCacheKey& key_, std::shared_ptr<const GraphicsShaderModules> modules,
     const std::array<const Shader::Info*, NUM_STAGES>& infos, EmitStagesFunc emit_stages,
     std::optional<MeshEmulationSetup> mesh_emulation_, LibraryParams library_params)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(modules)},
       library_cache{library_params.library_cache},
       libraries_only{library_params.library_cache && library_params.libraries_only},
       spirv_hashes{library_params.spirv_hashes}, build_workers{worker_thread},
@@ -603,7 +603,7 @@ GraphicsPipeline::GraphicsPipeline(
             Validate();
             if (library_cache) {
                 const bool has_module = std::ranges::any_of(
-                    spv_modules, [](const vk::ShaderModule& module) { return bool(module); });
+                    *spv_modules, [](const vk::ShaderModule& module) { return bool(module); });
                 bool made{};
                 try {
                     made = MakeLibraryPipeline(render_pass);
@@ -629,12 +629,9 @@ GraphicsPipeline::GraphicsPipeline(
                     // like the fast first build's optimized pipeline.
                     optimized_build.emplace(build_workers, [this, render_pass] {
                         optimized_pipeline = LinkLibraries(render_pass, true);
+                        spv_modules.reset();
                         optimized_ready.store(true, std::memory_order_release);
                     });
-                }
-                // The libraries hold the shaders now (the fallback has used them too).
-                for (vk::ShaderModule& module : spv_modules) {
-                    module.reset();
                 }
             } else if (FastFirstBuildEnabled() && worker_only_build && build_workers &&
                        !mesh_emulation) {
@@ -651,9 +648,7 @@ GraphicsPipeline::GraphicsPipeline(
                 optimized_build.emplace(build_workers, [this, render_pass, fast_ms] {
                     const auto optimized_begin = std::chrono::steady_clock::now();
                     optimized_pipeline = MakePipeline(render_pass, false);
-                    for (vk::ShaderModule& module : spv_modules) {
-                        module.reset();
-                    }
+                    spv_modules.reset();
                     optimized_ready.store(true, std::memory_order_release);
                     const double optimized_ms = std::chrono::duration<double, std::milli>(
                                                     std::chrono::steady_clock::now() - optimized_begin)
@@ -676,8 +671,10 @@ GraphicsPipeline::GraphicsPipeline(
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
                          "patch control points {}, device max patch size {})",
-                         exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
-                         spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
+                         exception.what(), spv_modules && (*spv_modules)[1] ? 1 : 0,
+                         spv_modules && (*spv_modules)[2] ? 1 : 0,
+                         spv_modules && (*spv_modules)[3] ? 1 : 0,
+                         key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
             throw;
         }
@@ -691,9 +688,7 @@ GraphicsPipeline::GraphicsPipeline(
         // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each). A
         // pending optimized build still needs them and resets them itself.
         if (!optimized_build) {
-            for (vk::ShaderModule& module : spv_modules) {
-                module.reset();
-            }
+            spv_modules.reset();
         }
         if (worker_only_build) {
             const auto elapsed = std::chrono::steady_clock::now() - begin;
@@ -1649,7 +1644,7 @@ void GraphicsPipeline::FillStates(PipelineStates& s) const {
     if (!vertex_binding_divisors.empty()) {
         s.vertex_input_ci.pNext = &s.input_divisor_ci;
     }
-    const bool has_tess_stages = !IsMeshPipeline() && (spv_modules[1] || spv_modules[2]);
+    const bool has_tess_stages = !IsMeshPipeline() && ((*spv_modules)[1] || (*spv_modules)[2]);
     s.has_tess_stages = has_tess_stages;
     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
@@ -2023,12 +2018,12 @@ vk::Pipeline GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool fast)
                 *pipeline_cache);
         };
         mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
-        mesh_compute_pipeline = make_compute(*spv_modules[mesh_emulation->mesh_stage],
+        mesh_compute_pipeline = make_compute(*(*spv_modules)[mesh_emulation->mesh_stage],
                                              *pipeline_layout,
                                              &stage_infos[mesh_emulation->mesh_stage]);
         if (mesh_emulation->has_task) {
             task_compute_pipeline =
-                make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0]);
+                make_compute(*(*spv_modules)[0], *pipeline_layout, &stage_infos[0]);
             distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
             distribution_pipeline =
                 make_compute(*distribution_module, *distribution_layout, nullptr);
@@ -2044,7 +2039,7 @@ vk::Pipeline GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool fast)
     };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
-        if (!spv_modules[stage]) {
+        if (!(*spv_modules)[stage]) {
             continue;
         }
         if (mesh_emulation && mesh_emulation->has_task && stage == mesh_emulation->mesh_stage) {
@@ -2068,7 +2063,7 @@ vk::Pipeline GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool fast)
             .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
             .flags = 0,
             .stage = stage_flag,
-            .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
+            .module = emulated_vertex ? *mesh_vertex_module : *(*spv_modules)[stage],
             .pName = "main",
             .pSpecializationInfo = nullptr,
         });
@@ -2188,7 +2183,7 @@ std::string GraphicsPipeline::ShaderLibraryKey(GplPart part, const PipelineState
             continue;
         }
         key_writer.Add(static_cast<u32>(stage));
-        key_writer.Add(static_cast<u32>(spv_modules[stage] ? 1 : 0));
+        key_writer.Add(static_cast<u32>((*spv_modules)[stage] ? 1 : 0));
         key_writer.Add(static_cast<u32>(StageFlag(stage_infos[stage], SlotStage(stage))));
         key_writer.Add(spirv_hashes[stage]);
         key_writer.AddBytes(stage_set_signatures[stage]);
@@ -2296,7 +2291,7 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
             library.set_layouts.push_back(builder.CreateDescriptorSetLayout(false));
             set_layouts[stage] = *library.set_layouts.back();
         }
-        if (!spv_modules[stage]) {
+        if (!(*spv_modules)[stage]) {
             continue;
         }
         const Shader::Info& info{stage_infos[stage]};
@@ -2312,7 +2307,7 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
             .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
             .flags = 0,
             .stage = stage_flag,
-            .module = *spv_modules[stage],
+            .module = *(*spv_modules)[stage],
             .pName = "main",
             .pSpecializationInfo = nullptr,
         });
@@ -2413,7 +2408,7 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
             // Warm-up with one stage and no partner: build only the part that has a shader.
             bool has_shader{};
             for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-                has_shader |= InPart(part, stage) && static_cast<bool>(spv_modules[stage]);
+                has_shader |= InPart(part, stage) && static_cast<bool>((*spv_modules)[stage]);
             }
             if (!has_shader) {
                 continue;
