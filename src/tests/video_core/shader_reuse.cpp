@@ -4,6 +4,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -177,4 +178,37 @@ TEST_CASE("Shader recorder preserves descriptor inference and source size", "[sh
     recorder.NoteInferredTextureType(0, Shader::TextureType::Color2D);
     REQUIRE(env.inferred_type == Shader::TextureType::Color2D);
     REQUIRE(recorder.TakeReads().Matches(env));
+}
+
+TEST_CASE("Shader reuse cache drops the least recently used keys past its bound",
+          "[shader_reuse]") {
+    Vulkan::ShaderReuseCache cache;
+    TestEnvironment env;
+    std::array<Shader::Environment*, 1> envs{&env};
+    const auto make_key = [](u64 index) {
+        Vulkan::ShaderTranslationKey key{};
+        key.unique_hashes[5] = index + 1;
+        return key;
+    };
+    std::vector<std::shared_ptr<Vulkan::ReusableShaders>> added;
+    for (u64 index = 0; index < Vulkan::ShaderReuseCache::MaxShaders; ++index) {
+        auto shaders = std::make_shared<Vulkan::ReusableShaders>();
+        shaders->reads.push_back(Translate(env));
+        cache.Add(make_key(index), shaders);
+        added.push_back(std::move(shaders));
+    }
+    // Keys 0 and 1 are used again, so keys 2 onwards are the least recently used.
+    REQUIRE(cache.Find(make_key(0), envs) == added[0]);
+    REQUIRE(cache.Find(make_key(1), envs) == added[1]);
+
+    auto one_more = std::make_shared<Vulkan::ReusableShaders>();
+    one_more->reads.push_back(Translate(env));
+    cache.Add(make_key(Vulkan::ShaderReuseCache::MaxShaders), one_more);
+
+    REQUIRE(cache.Find(make_key(0), envs) == added[0]);
+    REQUIRE(cache.Find(make_key(1), envs) == added[1]);
+    REQUIRE(cache.Find(make_key(Vulkan::ShaderReuseCache::MaxShaders), envs) == one_more);
+    REQUIRE(cache.Find(make_key(2), envs) == nullptr);
+    // Dropped shaders stay alive for whoever still holds them.
+    REQUIRE(added[2]->reads.size() == 1);
 }

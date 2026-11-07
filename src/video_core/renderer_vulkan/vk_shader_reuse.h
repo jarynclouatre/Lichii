@@ -230,9 +230,13 @@ struct ReusableShaders {
 /// the pipeline workers and the disk cache replay workers all use it.
 class ShaderReuseCache {
 public:
+    /// Shader sets kept at most. Past it, the least recently used quarter of the keys is dropped;
+    /// pipelines built from their shaders keep their own references.
+    static constexpr size_t MaxShaders = 4096;
+
     /// Shaders of an earlier pipeline with this key that fit `envs`, null when none do.
     [[nodiscard]] std::shared_ptr<const ReusableShaders> Find(
-        const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs) const;
+        const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs);
 
     void Add(const ShaderTranslationKey& key, std::shared_ptr<const ReusableShaders> shaders);
 
@@ -243,8 +247,18 @@ private:
     static constexpr size_t MaxVariants = 4;
     using Variants = boost::container::small_vector<std::shared_ptr<const ReusableShaders>, 1>;
 
-    mutable std::mutex mutex;
-    ::Common::unordered_map<ShaderTranslationKey, Variants, ShaderTranslationKeyHash> entries;
+    struct Entry {
+        Variants variants;
+        u64 last_use{}; ///< use_counter when the key was last found or added.
+    };
+
+    /// Drops the least recently used quarter of the keys. Called with the mutex held.
+    void EvictLeastRecentlyUsed();
+
+    std::mutex mutex;
+    ::Common::unordered_map<ShaderTranslationKey, Entry, ShaderTranslationKeyHash> entries;
+    u64 use_counter{};
+    size_t num_shaders{}; ///< Shader sets in entries.
 };
 
 } // namespace Vulkan

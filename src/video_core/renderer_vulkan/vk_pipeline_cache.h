@@ -202,7 +202,7 @@ private:
     /// Shaders of an earlier graphics pipeline that fit `envs` (vk_shader_reuse.h), or null.
     [[nodiscard]] std::shared_ptr<const ReusableShaders> FindReusableShaders(
         const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs,
-        u64 pipeline_hash) const;
+        u64 pipeline_hash);
 
     /// With `verify_against`, logs the stages whose SPIR-V differs from those shaders'.
     [[nodiscard]] std::optional<GraphicsShaders> BuildGraphicsShaders(

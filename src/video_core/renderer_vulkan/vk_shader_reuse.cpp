@@ -253,7 +253,7 @@ bool ReusableShaders::FitEnvironments(std::span<Shader::Environment* const> envs
 }
 
 std::shared_ptr<const ReusableShaders> ShaderReuseCache::Find(
-    const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs) const {
+    const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs) {
     Variants variants;
     {
         std::scoped_lock lock{mutex};
@@ -261,7 +261,8 @@ std::shared_ptr<const ReusableShaders> ShaderReuseCache::Find(
         if (it == entries.end()) {
             return nullptr;
         }
-        variants = it->second;
+        it->second.last_use = ++use_counter;
+        variants = it->second.variants;
     }
     // Checked without the lock: asking a live environment reads guest memory.
     for (const std::shared_ptr<const ReusableShaders>& shaders : variants) {
@@ -275,17 +276,40 @@ std::shared_ptr<const ReusableShaders> ShaderReuseCache::Find(
 void ShaderReuseCache::Add(const ShaderTranslationKey& key,
                            std::shared_ptr<const ReusableShaders> shaders) {
     std::scoped_lock lock{mutex};
-    Variants& variants{entries[key]};
-    if (variants.size() >= MaxVariants) {
+    Entry& entry{entries[key]};
+    entry.last_use = ++use_counter;
+    if (entry.variants.size() >= MaxVariants) {
         return;
     }
     // Workers replaying the disk cache can translate the same shaders at the same time.
-    const bool known{std::ranges::any_of(variants, [&shaders](const auto& variant) {
+    const bool known{std::ranges::any_of(entry.variants, [&shaders](const auto& variant) {
         return variant->reads == shaders->reads;
     })};
-    if (!known) {
-        variants.push_back(std::move(shaders));
+    if (known) {
+        return;
     }
+    entry.variants.push_back(std::move(shaders));
+    if (++num_shaders > MaxShaders) {
+        EvictLeastRecentlyUsed();
+    }
+}
+
+void ShaderReuseCache::EvictLeastRecentlyUsed() {
+    std::vector<u64> uses;
+    uses.reserve(entries.size());
+    for (const auto& [key, entry] : entries) {
+        uses.push_back(entry.last_use);
+    }
+    const auto oldest_end{uses.begin() + uses.size() / 4};
+    std::ranges::nth_element(uses, oldest_end);
+    const u64 threshold{*oldest_end};
+    boost::unordered::erase_if(entries, [this, threshold](const auto& pair) {
+        if (pair.second.last_use >= threshold) {
+            return false;
+        }
+        num_shaders -= pair.second.variants.size();
+        return true;
+    });
 }
 
 } // namespace Vulkan

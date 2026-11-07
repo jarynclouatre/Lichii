@@ -2657,7 +2657,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
 std::shared_ptr<const ReusableShaders> PipelineCache::FindReusableShaders(
     const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs,
-    u64 pipeline_hash) const {
+    u64 pipeline_hash) {
     if (!use_shader_reuse) {
         return nullptr;
     }
