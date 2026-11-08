@@ -23,6 +23,7 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/scm_rev.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/file_sys/nup_container.h"
@@ -380,14 +381,14 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
     return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
                      entries,   driver,
                      device_id, cache_version,
-                     no_inline};
+                     no_inline, Common::g_scm_rev};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
     std::ifstream in(WarmMarkerPath(warm_file));
     WarmStamp stamp;
     if (!(in >> stamp.size >> stamp.write_time >> stamp.entries >> stamp.driver >>
-          stamp.device_id >> stamp.cache_version >> stamp.no_inline)) {
+          stamp.device_id >> stamp.cache_version >> stamp.no_inline >> stamp.scm_rev)) {
         return std::nullopt;
     }
     return stamp;
@@ -396,7 +397,8 @@ std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
 bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
     out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' ' << stamp.no_inline << '\n';
+        << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' ' << stamp.no_inline << ' '
+        << stamp.scm_rev << '\n';
     out.close();
     return static_cast<bool>(out);
 }

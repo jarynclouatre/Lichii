@@ -56,7 +56,8 @@ bool WarmFileOutdated(const std::filesystem::path& warm_file);
 
 /// What a marker records: the precache file's size and last-write time, its entry count, the GPU
 /// driver version and device ID, the pipeline cache version and whether shared shader functions
-/// were built as calls (compute bit 0, graphics bit 1: the SPIR-V the driver compiled differs).
+/// were built as calls (compute bit 0, graphics bit 1: the SPIR-V the driver compiled differs),
+/// and the build, since another one can translate the same programs to other SPIR-V.
 /// Markers written without the last field no longer match, so that precache runs once more.
 struct WarmStamp {
     u64 size{};
@@ -66,13 +67,14 @@ struct WarmStamp {
     u32 device_id{};
     u32 cache_version{};
     u32 no_inline{};
+    std::string scm_rev;
 
-    /// True when `other` was written for the same file, driver, device, cache version and shader
-    /// calls mode (the entry count is informative).
+    /// True when `other` was written for the same file, driver, device, cache version, shader
+    /// calls mode and build (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
         return size == other.size && write_time == other.write_time && driver == other.driver &&
                device_id == other.device_id && cache_version == other.cache_version &&
-               no_inline == other.no_inline;
+               no_inline == other.no_inline && scm_rev == other.scm_rev;
     }
 };
 
