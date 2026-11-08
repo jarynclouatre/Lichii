@@ -43,3 +43,15 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+# Compute shaders build the functions they call from several places (a native program's global
+# memory functions) as calls instead of inlining them at every call site: NVIDIA spent 2-13 s on
+# single compute shaders of a test title, each a freeze of the whole emulator at its first
+# dispatch.
+# =0 builds the SPIR-V as emitted, as before.
+#EDEN_NX2_COMPUTE_NOINLINE=0
+# Same for graphics stages (vertex, tessellation, geometry, fragment): monolithic pipelines,
+# pipeline libraries and the graphics precache. =0 builds the SPIR-V as emitted, as before.
+#EDEN_NX2_GRAPHICS_NOINLINE=0
+# Threads of the shader precache on the loading screen, 1 to 64 (wins over the setting, whose
+# default 0 uses every CPU thread).
+#EDEN_NX2_WARM_THREADS=4

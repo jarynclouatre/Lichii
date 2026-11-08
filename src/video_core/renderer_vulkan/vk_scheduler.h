@@ -163,6 +163,12 @@ public:
     void SetGraphicsPipelineMissing(bool missing) {
         graphics_pipeline_missing = missing;
     }
+    /// The pipeline replaced its driver object (fast first build): bind it again at the next draw.
+    void ForgetGraphicsPipeline(GraphicsPipeline* pipeline) {
+        if (state.graphics_pipeline == pipeline) {
+            state.graphics_pipeline = nullptr;
+        }
+    }
     [[nodiscard]] bool GraphicsPipelineMissing() const {
         return graphics_pipeline_missing;
     }

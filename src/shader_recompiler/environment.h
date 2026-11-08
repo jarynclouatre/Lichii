@@ -126,6 +126,9 @@ public:
 
     [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }
 
+    /// Converted (Maxwell) instruction words of the program, 0 when unknown.
+    [[nodiscard]] virtual size_t CodeWords() const { return 0; }
+
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
 

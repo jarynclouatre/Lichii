@@ -1780,6 +1780,9 @@ void RasterizerVulkan::DrawTexture() {
                          sampler->Handle(), dst_region, src_region, src_size);
 }
 
+/// Clears the selected color, depth and stencil targets over `layer_count` layers, with a clear
+/// attachment or a blit when only some channels are written. Also tells the pipeline cache which
+/// targets were cleared (heavy draw skip).
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
@@ -1801,7 +1804,6 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     if (!use_color && !use_depth && !use_stencil) {
         return;
     }
-
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
@@ -1909,6 +1911,50 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         clear_rect.rect.offset.x == 0 && clear_rect.rect.offset.y == 0 &&
         clear_rect.rect.extent.width >= render_area.width &&
         clear_rect.rect.extent.height >= render_area.height;
+    // Heavy skip (CurrentTargetIsRedrawn): only a clear of the whole target, every layer, says the
+    // target is rebuilt this frame; a scissored or partial clear may patch a tile of a cache.
+    if (clear_covers_render_area && base_array_layer == 0 &&
+        clear_layers.count >= framebuffer->Layers()) {
+        // The framebuffer may be smaller than an attachment (an atlas or array drawn in parts):
+        // the clear has to cover the attachment's own size and layers, scaled like the
+        // framebuffer. A pitch-linear width is in bytes and never matches, so it never counts.
+        const auto covers = [&](u32 width, u32 height, u32 layers) {
+            return render_area.width >= ((width * up_scale) >> down_shift) &&
+                   render_area.height >= ((height * up_scale) >> down_shift) &&
+                   framebuffer->Layers() >= (std::max)(layers, 1U);
+        };
+        const u32 clear_rt = regs.clear_surface.RT;
+        u64 color_address = 0;
+        if (use_color && color_full_channels && clear_rt < Maxwell::NumRenderTargets) {
+            const auto& rt = regs.rt[clear_rt];
+            const u32 layers = rt.tile_mode.dim_control.Value() ==
+                                       Maxwell::TileMode::DimensionControl::DefineArraySize
+                                   ? rt.depth.Value()
+                                   : 1U;
+            if (rt.tile_mode.is_pitch_linear.Value() == 0 &&
+                covers(rt.width, rt.height, layers)) {
+                color_address = rt.Address();
+            }
+        }
+        // A combined depth/stencil target counts only when every aspect it has is cleared in
+        // full: depth, and stencil with all of its bits written.
+        u64 depth_address = 0;
+        const bool depth_complete = !framebuffer->HasAspectDepthBit() || use_depth;
+        const bool stencil_complete =
+            !framebuffer->HasAspectStencilBit() || (use_stencil && regs.stencil_front_mask == 0xFF);
+        if ((use_depth || use_stencil) && depth_complete && stencil_complete &&
+            regs.zeta_enable != 0) {
+            const auto& zeta = regs.zeta_size;
+            const u32 layers =
+                zeta.dim_control.Value() == Maxwell::ZetaSize::DimensionControl::DefineArraySize
+                    ? zeta.depth.Value()
+                    : 1U;
+            if (covers(zeta.width, zeta.height, layers)) {
+                depth_address = regs.zeta.Address();
+            }
+        }
+        pipeline_cache.NoteClear(color_address, depth_address);
+    }
     const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && (!regs.clear_control.use_scissor || clear_covers_render_area) &&
                                  clear_layers.covers_all_layers &&
                                  !scheduler.IsRenderPassActive() &&

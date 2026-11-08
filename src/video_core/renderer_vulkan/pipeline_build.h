@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -16,6 +17,35 @@
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 
 namespace Vulkan {
+
+/// EDEN_NX2_FAST_FIRST=1: a pipeline built while the game runs is first created with
+/// VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT and drawn with as soon as the driver returns it;
+/// the optimized build follows on a worker and takes its place at a later draw. Trades the seconds
+/// the driver spends on the heaviest pipelines (a demanding Switch 2 test title, first visit:
+/// draws held up to 7 s of every 10 s) for a slower shader during that time.
+inline bool FastFirstBuildEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_FIRST");
+        return value && *value && *value != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_HEAVY_SKIP: a native pipeline of at least this many converted instructions (all
+/// stages) has its draws skipped while the driver builds it, instead of holding every draw
+/// behind it. "1" picks 4000; 0 or unset turns it off. In a demanding Switch 2 test title's first
+/// visits every driver build over 500 ms was above 4000, and they made ~90% of the compile time.
+inline size_t HeavySkipWords() {
+    static const size_t words = [] {
+        const char* value = std::getenv("EDEN_NX2_HEAVY_SKIP");
+        if (!value || !*value) {
+            return size_t{0};
+        }
+        const size_t parsed = static_cast<size_t>(std::strtoull(value, nullptr, 10));
+        return parsed == 1 ? size_t{4000} : parsed;
+    }();
+    return words;
+}
 
 class EmissionBudget {
 public:

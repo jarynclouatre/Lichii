@@ -311,8 +311,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "files internally."));
     INSERT(Settings, precache_shaders, tr("Precache shaders before game start:"),
            tr("Builds shaders on the loading screen, on every CPU thread, so they don't stutter "
-              "the first time the game uses them: the compute shaders found in the game files, "
-              "and the shaders saved by earlier play sessions that the normal shader loading "
+              "the first time the game uses them: the compute shaders found in the game files "
+              "(and their graphics shaders with Shader libraries on), and the shaders saved by "
+              "earlier play sessions that the normal shader loading "
               "leaves for later. The first launch reads the game files and takes a few minutes; "
               "later launches only build what is new, until the GPU driver changes. The loading "
               "screen has a Skip button.\nAsk asks at launch while the game has never been "
@@ -328,6 +329,22 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Used by the Bounded mode: the most time per frame that Switch 2 draws may wait in "
               "total for pipelines that are still building. Once spent, the remaining unbuilt "
               "draws of that frame are skipped."));
+
+    INSERT(Settings, use_graphics_pipeline_library,
+           tr("Shader libraries (faster first-time shader builds)"),
+           tr("Builds each shader stage once and links them into pipelines, so new shaders "
+              "cause shorter stutters.\nAlso lets Precache shaders before game start build the "
+              "graphics shaders found in the game files.\nTakes effect after restarting the "
+              "game."));
+    INSERT(Settings, shader_calls_not_inlined,
+           tr("Faster shader compiles (shared functions as calls)"),
+           tr("Builds large functions that a shader uses in several places once, as calls, "
+              "instead of copying them into every place. Driver compiles of such shaders get "
+              "several times faster (compute precache about 3x); the game may run slightly "
+              "slower.\nApplies to shaders built after the change."));
+    INSERT(Settings, shader_warm_threads, tr("Shader precache threads:"),
+           tr("CPU threads the shader precache uses on the loading screen. 0 uses every CPU "
+              "thread.\nTakes effect at the next game start."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "

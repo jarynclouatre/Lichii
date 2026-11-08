@@ -380,6 +380,22 @@ public:
                id != VK_DRIVER_ID_MESA_RADV;
     }
 
+    /// Whether pipelines linked from graphics pipeline libraries without link time optimization
+    /// draw correctly. On AMD's Windows driver such links draw white fringes around alpha blended
+    /// effects (clouds, particles and glows in a test title, RX 7800 XT), while optimized links
+    /// and monolithic pipelines from the same SPIR-V do not, so libraries are linked optimized
+    /// there. EDEN_NX2_GPL_FAST_LINK=1 allows fast links on any driver, =0 on none.
+    bool CanFastLinkGraphicsLibraries() const {
+        static const char forced = [] {
+            const char* value = std::getenv("EDEN_NX2_GPL_FAST_LINK");
+            return value == nullptr ? '\0' : value[0];
+        }();
+        if (forced == '0' || forced == '1') {
+            return forced == '1';
+        }
+        return GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY;
+    }
+
     /// Returns true for tile-based deferred renderers.
     bool IsTiler() const {
         switch (GetDriverID()) {
@@ -704,6 +720,13 @@ FN_MAX_LIMIT_LIST
     /// Returns the largest patch size (control points, and TCS output vertices) a pipeline allows.
     u32 GetMaxTessellationPatchSize() const {
         return properties.properties.limits.maxTessellationPatchSize;
+    }
+
+    /// Graphics pipelines are linked from per-stage libraries: the use_graphics_pipeline_library
+    /// setting (or EDEN_NX2_GPL=1) is on and the device has VK_EXT_graphics_pipeline_library
+    /// with fast linking.
+    bool IsExtGraphicsPipelineLibrarySupported() const {
+        return graphics_pipeline_library_enabled;
     }
 
     /// Returns true if the device supports task and mesh shaders (VK_EXT_mesh_shader).
@@ -1331,6 +1354,7 @@ private:
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
@@ -1342,6 +1366,12 @@ private:
     Extensions extensions{};
     Features features{};
     Properties properties{};
+
+    /// EDEN_NX2_GPL: kept out of the extension tables so a run without the switch creates the
+    /// device exactly as before.
+    bool graphics_pipeline_library_requested{};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library_features{};
+    bool graphics_pipeline_library_enabled{};
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};

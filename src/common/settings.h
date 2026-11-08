@@ -668,6 +668,28 @@ struct Values {
                                                          true,
                                                          true};
 
+    // Graphics pipeline libraries (VK_EXT_graphics_pipeline_library): pipelines linked from
+    // per-stage shader libraries. EDEN_NX2_GPL=1 also turns it on.
+    SwitchableSetting<bool> use_graphics_pipeline_library{
+        linkage, false, "use_graphics_pipeline_library", Category::RendererAdvanced};
+
+    // Large shader functions called from several places are built as calls instead of being
+    // copied into every caller (much faster driver compiles). EDEN_NX2_COMPUTE_NOINLINE=0 and
+    // EDEN_NX2_GRAPHICS_NOINLINE=0 still override.
+    SwitchableSetting<bool> shader_calls_not_inlined{linkage, true, "shader_calls_not_inlined",
+                                                     Category::RendererAdvanced};
+
+    // Threads of the shader precache on the loading screen, 0 for every CPU thread.
+    // EDEN_NX2_WARM_THREADS overrides.
+    SwitchableSetting<u32, true> shader_warm_threads{linkage,
+                                                     0,
+                                                     0,
+                                                     64,
+                                                     "shader_warm_threads",
+                                                     Category::RendererAdvanced,
+                                                     Specialization::Countable,
+                                                     true,
+                                                     true};
     // Precache shaders before the game starts: the compute programs in the game files and the
     // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
     // driver's cache holds them before the game first uses them.

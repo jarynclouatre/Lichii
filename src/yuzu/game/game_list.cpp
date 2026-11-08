@@ -469,6 +469,8 @@ void GameList::SetReportableProgramId(u64 program_id) {
     reportable_program_id = program_id;
 }
 
+/// Fills the context menu of a game entry (folders, cache, mods, shader precache, dumps,
+/// shortcuts and the rest) and connects each action to its request signal.
 void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::string& path) {
     // TODO(crueter): Refactor this and make it less bad
     QAction* favorite = context_menu.addAction(tr("Favorite"));

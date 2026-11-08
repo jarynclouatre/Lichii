@@ -10,6 +10,7 @@
 #include <stop_token>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
@@ -25,6 +26,12 @@ namespace VideoCommon::ShaderWarm {
 /// files, in pipeline cache format with no recorded reads.
 std::filesystem::path ComputeWarmPath(u64 title_id);
 
+/// The title's graphics precache file (<shader dir>/<title id>/warm-graphics.bin): the vertex
+/// and fragment programs found in the game files, as single-stage pipeline cache entries with
+/// guessed draw state. Built as pipeline libraries, so it needs graphics pipeline library
+/// support.
+std::filesystem::path GraphicsWarmPath(u64 title_id);
+
 /// "Already precached" marker of a precache file (same folder, extension .done), written by the
 /// emulator after the precache ran to the end. A matching marker skips the precache at boot.
 std::filesystem::path WarmMarkerPath(const std::filesystem::path& warm_file);
@@ -39,7 +46,9 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
 /// What a marker records: the precache file's size and last-write time, its entry count, the GPU
-/// driver version and device ID and the pipeline cache version.
+/// driver version and device ID, the pipeline cache version and whether shared shader functions
+/// were built as calls (compute bit 0, graphics bit 1: the SPIR-V the driver compiled differs).
+/// Markers written without the last field no longer match, so that precache runs once more.
 struct WarmStamp {
     u64 size{};
     s64 write_time{};
@@ -47,18 +56,21 @@ struct WarmStamp {
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u32 no_inline{};
 
-    /// True when `other` was written for the same file, driver, device and cache version (the
-    /// entry count is informative).
+    /// True when `other` was written for the same file, driver, device, cache version and shader
+    /// calls mode (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
         return size == other.size && write_time == other.write_time && driver == other.driver &&
-               device_id == other.device_id && cache_version == other.cache_version;
+               device_id == other.device_id && cache_version == other.cache_version &&
+               no_inline == other.no_inline;
     }
 };
 
 /// The stamp of `warm_file` as it is now, empty when its size or time cannot be read.
 std::optional<WarmStamp> CurrentWarmStamp(const std::filesystem::path& warm_file, u64 entries,
-                                          u32 driver, u32 device_id, u32 cache_version);
+                                          u32 driver, u32 device_id, u32 cache_version,
+                                          u32 no_inline = 0);
 
 /// The marker of `warm_file`, empty when there is none or it cannot be read.
 std::optional<WarmStamp> ReadWarmMarker(const std::filesystem::path& warm_file);
@@ -111,8 +123,8 @@ std::unordered_set<u64> ReadPrecachedPipelines(const std::filesystem::path& file
 bool WritePrecachedPipelines(const std::filesystem::path& file, const DriverStamp& stamp,
                              const std::unordered_set<u64>& hashes);
 
-/// Removes the title's precache file, its marker and count, the list of precached graphics
-/// pipelines and a leftover temporary file (rebuild or delete from the UI). Returns false when a file exists but cannot be removed, with
+/// Removes the title's precache files (compute and graphics), their markers and counts, the list
+/// of precached graphics pipelines and leftover temporary files (rebuild or delete from the UI). Returns false when a file exists but cannot be removed, with
 /// the reason in `error` when given.
 bool DeleteWarmFiles(u64 title_id, std::string* error = nullptr);
 
@@ -127,25 +139,32 @@ struct Result {
     std::string error;           ///< Empty when ok
     size_t archives{};           ///< Shader archives found in the game files
     size_t compute_programs{};   ///< Entries written to the precache file
+    size_t vertex_programs{};    ///< Vertex entries written to the graphics precache file
+    size_t fragment_programs{};  ///< Fragment entries written to the graphics precache file
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
 
-/// Builds the precache file for the game at `game_path` (any format the loader opens, Switch 2
+/// Builds the precache files for the game at `game_path` (any format the loader opens, Switch 2
 /// .nup first), from the user's own copy and keys, with no external tools. Runs on the calling
-/// thread; `progress` is called from it; stops early when `stop` is requested.
+/// thread; `progress` is called from it; stops early when `stop` is requested. The game's
+/// existing pipeline cache, when present, is used for the graphics draw state guesses; otherwise
+/// built-in defaults are used.
 Result BuildWarmFiles(Core::System& system, const std::filesystem::path& game_path, u64 title_id,
                       const std::function<void(const Progress&)>& progress,
                       std::stop_token stop);
 
 /// Overrides for BuildWarmFilesWith (tests and tools).
 struct BuildOptions {
-    /// Folder for warm-compute.bin; empty: <shader dir>/<title id>.
+    /// Folder for warm-compute.bin and warm-graphics.bin; empty: <shader dir>/<title id>.
     std::filesystem::path output_dir;
+    /// Pipeline caches used for the draw state guesses. Unset: the title's own pipeline cache
+    /// when it exists, else the built-in defaults. Set but empty: always the built-in defaults.
+    std::optional<std::vector<std::filesystem::path>> runtime_caches;
     /// Conversion threads, 0: a quarter of the CPU threads, 2 to 6.
     size_t threads{};
 };
 
-/// BuildWarmFiles with an explicit output folder.
+/// BuildWarmFiles with explicit output folder and draw state sources.
 Result BuildWarmFilesWith(Core::System& system, const std::filesystem::path& game_path,
                           u64 title_id, const BuildOptions& options,
                           const std::function<void(const Progress&)>& progress,

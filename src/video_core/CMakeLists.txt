@@ -210,6 +210,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
+    renderer_vulkan/vk_pipeline_library.cpp
+    renderer_vulkan/vk_pipeline_library.h
     renderer_vulkan/vk_multi_range_buffer.cpp
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
@@ -281,8 +283,11 @@ add_library(video_core STATIC
     shader_warm/shader_archives.h
     shader_warm/shader_warm_builder.cpp
     shader_warm/shader_warm_builder.h
+    shader_warm/warm_defaults.cpp
     shader_warm/warm_records.cpp
     shader_warm/warm_records.h
+    spirv_inline_control.cpp
+    spirv_inline_control.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp

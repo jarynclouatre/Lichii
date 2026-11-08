@@ -22,6 +22,7 @@
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/frontend/maxwell/structured_control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
@@ -106,8 +107,23 @@ u64 IndirectCbufKey(u32 bank, u32 offset, u32 indirect) {
     return (u64{1} << 63) | (u64{indirect & 0x3fffff} << 40) | CbufKey(bank, offset);
 }
 
+// --guess-missing: values used for reads the environment has no record of. The defaults
+// equal the emulator's warm-up loader guesses.
+struct Guesses {
+    bool enabled{};
+    u32 cbuf0{0x10000000};
+    u32 cbuf_other{0};
+    u32 texture_type{3};
+    u32 pixel_format{16};
+    bool storage_pointer{true};       // bank 0
+    bool storage_pointer_other{false}; // banks 1..17 (GuessMissing::storage_pointer_other)
+};
+
 class OfflineEnvironment final : public Shader::Environment {
 public:
+    Guesses guesses;
+    u32 guessed_reads{};
+
     void Load(std::span<const u8> bytes, u32 version) {
         Reader reader{bytes};
         const u64 size = reader.Read<u64>();
@@ -250,21 +266,29 @@ public:
     bool HasNativeInstructions() const override {
         return IsNativeProgram();
     }
+    /// Recorded storage pointer classification, or the bank's guess when guessing is on.
     bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override {
-        return Lookup(pointers, CbufKey(bank, offset), "storage pointer classification") != 0;
+        return Find(pointers, CbufKey(bank, offset), "storage pointer classification",
+                    u8{bank == 0 ? guesses.storage_pointer : guesses.storage_pointer_other}) != 0;
     }
+    /// Recorded storage pointer table classification, or the bank's guess when guessing is on.
     bool IsCbufIndirectStorageBufferPointer(u32 bank, u32 offset, u32 indirect) override {
-        return Lookup(pointers, IndirectCbufKey(bank, offset, indirect),
-                      "storage pointer table classification") != 0;
+        return Find(pointers, IndirectCbufKey(bank, offset, indirect),
+                    "storage pointer table classification",
+                    u8{bank == 0 ? guesses.storage_pointer : guesses.storage_pointer_other}) != 0;
     }
+    /// Recorded constant buffer value, or the bank's guess when guessing is on.
     u32 ReadCbufValue(u32 bank, u32 offset) override {
-        return Lookup(cbuf_values, CbufKey(bank, offset), "constant buffer value");
+        return Find(cbuf_values, CbufKey(bank, offset), "constant buffer value",
+                    bank == 0 ? guesses.cbuf0 : guesses.cbuf_other);
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
-        return Lookup(texture_types, handle, "texture type");
+        return Find(texture_types, handle, "texture type",
+                    static_cast<Shader::TextureType>(guesses.texture_type));
     }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
-        return Lookup(texture_formats, handle, "texture pixel format");
+        return Find(texture_formats, handle, "texture pixel format",
+                    static_cast<Shader::TexturePixelFormat>(guesses.pixel_format));
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
         using F = Shader::TexturePixelFormat;
@@ -323,6 +347,17 @@ public:
     std::vector<u64> code;
 
 private:
+    /// The recorded value for `key`. With guessing on, a missing value counts as a guessed read and
+    /// returns `guess`; otherwise it throws.
+    template <typename K, typename V>
+    V Find(const std::map<K, V>& values, K key, std::string_view name, V guess) {
+        if (guesses.enabled && !values.contains(key)) {
+            ++guessed_reads;
+            return guess;
+        }
+        return Lookup(values, key, name);
+    }
+
     u32 low{}, high{}, local_memory{}, shared_memory{}, viewport{1}, texture_bound{~0U};
     std::array<u32, 3> workgroup{1, 1, 1};
     std::map<u32, Shader::TextureType> texture_types;
@@ -526,6 +561,9 @@ Shader::RuntimeInfo Runtime(std::span<const u8> key, Stage stage, Json& assumpti
 }
 } // namespace
 
+/// Parses the command line, reads the program (and its environment and pipeline key when given),
+/// translates it and writes the SPIR-V or lowered code. Prints a JSON report; the exit code is 2
+/// for bad input and 1 for a failed translation.
 int main(int argc, char** argv) {
     Json diagnostic{{"schema_version", 1}, {"status", "error"},           {"phase", "input"},
                     {"stage", nullptr},    {"input_format", nullptr},     {"source_bytes", 0},
@@ -534,12 +572,15 @@ int main(int argc, char** argv) {
         if constexpr (std::endian::native != std::endian::little) {
             throw std::runtime_error("Only little-endian hosts are supported");
         }
-        std::string input, output, environment, pipeline_key, format{"instructions"};
+        std::string input, output, environment, pipeline_key, override_out,
+            format{"instructions"};
         std::optional<Stage> requested_stage;
         u32 version{};
         bool lower_only{};
         bool packed_code{};
         bool capture_extent{};
+        Guesses guesses;
+        bool storage_pointer_other_set{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg{argv[i]};
             if (arg == "--help") {
@@ -547,7 +588,11 @@ int main(int argc, char** argv) {
                              "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
                              "  [--format instructions|native-header] [--environment FILE "
                              "--cache-version 46|47|48|49|50|51|52|53]\n"
-                             "  [--pipeline-key FILE] [--capture-extent] "
+                             "  [--guess-missing [--guess-cbuf0 HEX] [--guess-cbuf-other HEX]\n"
+                             "   [--guess-texture-type N] [--guess-pixel-format N] "
+                             "[--guess-storage-pointer 0|1]\n"
+                             "   [--guess-storage-pointer-other 0|1]]\n"
+                             "  [--pipeline-key FILE] [--capture-extent] [--override-out FILE] "
                              "(--output SPV | --lower-only WORDS | --packed-code WORDS)\n";
                 return 0;
             }
@@ -561,6 +606,10 @@ int main(int argc, char** argv) {
                 capture_extent = true;
                 continue;
             }
+            if (arg == "--guess-missing") {
+                guesses.enabled = true;
+                continue;
+            }
             if (++i == argc)
                 throw std::runtime_error("Missing value for " + arg);
             const std::string value{argv[i]};
@@ -570,9 +619,34 @@ int main(int argc, char** argv) {
                 format = value;
             else if (arg == "--environment")
                 environment = value;
+            else if (arg == "--override-out")
+                override_out = value;
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
-            else if (arg == "--cache-version") {
+            else if (arg == "--guess-cbuf0")
+                guesses.cbuf0 = static_cast<u32>(std::stoul(value, nullptr, 16));
+            else if (arg == "--guess-cbuf-other")
+                guesses.cbuf_other = static_cast<u32>(std::stoul(value, nullptr, 16));
+            else if (arg == "--guess-texture-type") {
+                guesses.texture_type = static_cast<u32>(std::stoul(value, nullptr, 0));
+                if (guesses.texture_type >= Shader::NUM_TEXTURE_TYPES)
+                    throw std::runtime_error("Invalid --guess-texture-type");
+            } else if (arg == "--guess-pixel-format") {
+                guesses.pixel_format = static_cast<u32>(std::stoul(value, nullptr, 0));
+                if (guesses.pixel_format > std::numeric_limits<u8>::max())
+                    throw std::runtime_error("Invalid --guess-pixel-format");
+            } else if (arg == "--guess-storage-pointer") {
+                if (value != "0" && value != "1")
+                    throw std::runtime_error("Expected --guess-storage-pointer 0 or 1");
+                guesses.storage_pointer = value == "1";
+                if (!storage_pointer_other_set)
+                    guesses.storage_pointer_other = guesses.storage_pointer;
+            } else if (arg == "--guess-storage-pointer-other") {
+                if (value != "0" && value != "1")
+                    throw std::runtime_error("Expected --guess-storage-pointer-other 0 or 1");
+                guesses.storage_pointer_other = value == "1";
+                storage_pointer_other_set = true;
+            } else if (arg == "--cache-version") {
                 if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
                     value != "51" && value != "52" && value != "53")
                     throw std::runtime_error("Expected cache version 46 to 53");
@@ -600,6 +674,7 @@ int main(int argc, char** argv) {
             }
         }
         OfflineEnvironment env;
+        env.guesses = guesses;
         if (!environment.empty())
             env.Load(ReadFile(environment), version);
         if (requested_stage) {
@@ -699,6 +774,16 @@ int main(int argc, char** argv) {
                 return 1;
             }
             diagnostic["lowered_words"] = lowered.instructions.size();
+            // The emulator's key for this program (Shader::Ampere::NativeProgramKey over the
+            // captured source), and the lowering as a program override record
+            // (the tools/nx2/make_*_warm.py scripts read it).
+            diagnostic["native_key"] = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
+            if (!override_out.empty()) {
+                const auto record = Shader::Ampere::EncodeProgramOverride(native, lowered);
+                if (record.empty())
+                    throw std::runtime_error("Cannot encode the lowering as an override record");
+                WriteFile(override_out, record);
+            }
             if (lower_only) {
                 diagnostic["phase"] = "output";
                 if (packed_code) {
@@ -771,6 +856,8 @@ int main(int argc, char** argv) {
         Shader::Backend::Bindings bindings{};
         const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
         diagnostic["spirv_words"] = spirv.size();
+        if (guesses.enabled)
+            diagnostic["guessed_reads"] = env.guessed_reads;
         diagnostic["phase"] = "output";
         WriteFile(output, spirv);
         diagnostic["status"] = "ok";

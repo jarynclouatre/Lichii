@@ -274,6 +274,8 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
                          .c_str());
 }
 
+/// Declares one uniform block per constant buffer descriptor, viewed as an array of `type`, in
+/// the context's descriptor set from `binding` on.
 void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinitions::*member_type,
                         u32 binding, Id type, char type_char, u32 element_size) {
     const Id array_type{ctx.TypeArray(type, ctx.Const(65536U / element_size))};
@@ -292,7 +294,7 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("c{}", desc.index));
         for (size_t i = 0; i < desc.count; ++i) {
             ctx.cbufs[desc.index + i].*member_type = id;
@@ -304,6 +306,8 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     }
 }
 
+/// Declares one storage buffer per storage buffer descriptor, viewed as a runtime array of `type`,
+/// in the context's descriptor set from `binding` on.
 void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
                  Id StorageDefinitions::*member_type, const Info& info, u32 binding, Id type,
                  u32 stride) {
@@ -325,7 +329,7 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     for (const StorageBufferDescriptor& desc : info.storage_buffers_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("ssbo{}", index));
         if (ctx.profile.supported_spirv >= 0x00010400) {
             ctx.interfaces.push_back(id);
@@ -471,13 +475,16 @@ void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_vie
     }
 }
 
+/// Starts the SPIR-V module of `program`: common types and interfaces, then every resource in the
+/// descriptor set and binding ranges `bindings` gives (one shared range when bindings are unified).
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_,
                          IR::Program& program, Bindings& bindings)
     : Sirit::Module(profile_.supported_spirv), profile{profile_}, runtime_info{runtime_info_},
       requires_coherent_global_memory{program.info.requires_coherent_global_memory},
       requires_coherent_image_memory{program.info.requires_coherent_image_memory},
       stage{program.stage}, texture_rescaling_index{bindings.texture_scaling_index},
-      image_rescaling_index{bindings.image_scaling_index} {
+      image_rescaling_index{bindings.image_scaling_index},
+      descriptor_set{bindings.descriptor_set} {
     const bool is_unified{profile.unified_descriptor_binding};
     u32& uniform_binding{is_unified ? bindings.unified : bindings.uniform_buffer};
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
@@ -1557,6 +1564,8 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
     }
 }
 
+/// Declares a sampled buffer image per texture buffer descriptor and advances `binding`. Throws on
+/// arrays of texture buffers.
 void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
     if (info.texture_buffer_descriptors.empty()) {
         return;
@@ -1572,7 +1581,7 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
@@ -1585,6 +1594,7 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
     }
 }
 
+/// Declares a storage buffer image per image buffer descriptor and advances `binding`.
 void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     image_buffers.reserve(info.image_buffer_descriptors.size());
     for (const ImageBufferDescriptor& desc : info.image_buffer_descriptors) {
@@ -1595,7 +1605,7 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "imgbuf"));
         if (info.requires_coherent_image_memory) {
             Decorate(id, spv::Decoration::Coherent);
@@ -1614,6 +1624,8 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     }
 }
 
+/// Declares a sampled image (or array of them) per texture descriptor, advancing `binding` and
+/// `scaling_index` for each.
 void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
     textures.reserve(info.texture_descriptors.size());
     for (const TextureDescriptor& desc : info.texture_descriptors) {
@@ -1623,7 +1635,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "tex"));
         textures.push_back({
             .id = id,
@@ -1645,6 +1657,8 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
+/// Declares a storage image per image descriptor, advancing `binding` and `scaling_index` for
+/// each.
 void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {
     images.reserve(info.image_descriptors.size());
     for (const ImageDescriptor& desc : info.image_descriptors) {
@@ -1653,7 +1667,7 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "img"));
         if (info.requires_coherent_image_memory) {
             Decorate(id, spv::Decoration::Coherent);
