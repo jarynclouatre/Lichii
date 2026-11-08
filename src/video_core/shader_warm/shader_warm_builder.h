@@ -57,6 +57,7 @@ struct Result {
     size_t compute_programs{};   ///< Entries written to the compute file
     size_t vertex_programs{};    ///< Vertex entries written to the graphics file
     size_t fragment_programs{};  ///< Fragment entries written to the graphics file
+    size_t mesh_entries{};       ///< Task/mesh entries (with their fragment) in the graphics file
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
 

@@ -1620,7 +1620,9 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
             GraphicsPipelineLibraryCache::SetNoRetainOnThisThread(true);
             ShaderPools pools;
             while (!stop.stop_requested() && !warm_cancel) {
-                FileEnvironment env;
+                // One stage, or a task/mesh variation: [task,] mesh and fragment.
+                std::array<FileEnvironment, 3> envs;
+                u32 num_envs{};
                 GraphicsPipelineCacheKey key{};
                 {
                     std::scoped_lock lock{reader->mutex};
@@ -1628,15 +1630,16 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                         break;
                     }
                     try {
-                        u32 num_envs{};
                         reader->file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-                        if (num_envs != 1) {
+                        if (num_envs == 0 || num_envs > envs.size()) {
                             LOG_WARNING(Render_Vulkan,
                                         "Nx2Perf graphics_warm: unexpected entry, stopping");
                             reader->failed = true;
                             break;
                         }
-                        env.Deserialize(reader->file);
+                        for (u32 index = 0; index < num_envs; ++index) {
+                            envs[index].Deserialize(reader->file);
+                        }
                         reader->file.read(reinterpret_cast<char*>(&key), sizeof(key));
                         ++reader->read;
                         reader->position = reader->file.tellg();
@@ -1647,11 +1650,14 @@ void PipelineCache::StartGraphicsWarm(u64 title_id) {
                         break;
                     }
                 }
-                env.SetGuessMissing(&guess);
+                std::array<Shader::Environment*, 3> env_ptrs{};
+                for (u32 index = 0; index < num_envs; ++index) {
+                    envs[index].SetGuessMissing(&guess);
+                    env_ptrs[index] = &envs[index];
+                }
                 WarmResult result = WarmResult::Unbuildable;
                 try {
-                    Shader::Environment* const env_ptr = &env;
-                    result = WarmGraphicsLibraries(pools, key, std::span{&env_ptr, 1});
+                    result = WarmGraphicsLibraries(pools, key, std::span{env_ptrs}.first(num_envs));
                 } catch (const vk::Exception& e) {
                     LOG_DEBUG(Render_Vulkan, "graphics_warm: {}", e.what());
                     result = WarmResult::DriverFailed;
@@ -2446,11 +2452,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 storage_buffers, set_limit);
         }
     }
-    // Graphics pipeline libraries (EDEN_NX2_GPL). Left on the monolithic route: task and mesh
-    // pipelines, transform feedback, a static rasterizer discard, and stages whose texture or
+    // Graphics pipeline libraries (EDEN_NX2_GPL). Left on the monolithic route: emulated task and
+    // mesh pipelines, transform feedback, a static rasterizer discard, and stages whose texture or
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
-        if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
+        if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0 ||
+            mesh_emulation) {
             return false;
         }
         if (key.state.extended_dynamic_state_2 == 0 &&
@@ -2466,9 +2473,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 continue;
             }
             const Shader::IR::Program& program{programs[index]};
-            if (program.stage == Shader::Stage::Task || program.stage == Shader::Stage::Mesh) {
-                return false;
-            }
             const bool fragment = index + 1 == Maxwell::MaxShaderProgram;
             (fragment ? fragment_textures : pre_textures) += program.info.texture_descriptors.size();
             (fragment ? fragment_images : pre_images) += program.info.image_descriptors.size();

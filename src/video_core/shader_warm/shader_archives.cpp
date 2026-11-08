@@ -76,6 +76,7 @@ struct Record {
     ProgramStage stage;
     Bytes code;
     Bytes control;
+    bool new_variation = true;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -448,6 +449,7 @@ std::vector<Record> ParseBnsh(Bytes data) {
             slots.emplace_back(0x40, ProgramStage::Task);
             slots.emplace_back(0x48, ProgramStage::Mesh);
         }
+        bool new_variation = true;
         for (size_t index = 0; index < slots.size(); ++index) {
             const auto [slot, stage] = slots[index];
             const u64 record = Le<u64>(data, program + slot);
@@ -482,7 +484,8 @@ std::vector<Record> ParseBnsh(Bytes data) {
                     throw ArchiveError("BNSH graphics stage disagrees with native header");
                 }
             }
-            result.push_back({stage, code, control});
+            result.push_back({stage, code, control, new_variation});
+            new_variation = false;
         }
     }
     return result;
@@ -760,7 +763,8 @@ struct Walker {
     /// Passes every record to the caller's record callback.
     void Emit(const std::vector<Record>& records) const {
         for (const auto& record : records) {
-            on_record(ShaderRecord{record.stage, record.code, record.control});
+            on_record(
+                ShaderRecord{record.stage, record.code, record.control, record.new_variation});
         }
     }
 

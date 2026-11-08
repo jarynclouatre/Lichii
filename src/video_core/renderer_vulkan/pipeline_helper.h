@@ -319,6 +319,12 @@ public:
         });
     }
 
+    /// A layout without the task or mesh program's bindings whose push constant range still
+    /// reaches those stages (the shared layouts of a task/mesh pipeline's libraries).
+    void EnableMesh() noexcept {
+        uses_mesh = true;
+    }
+
     /// Mesh emulation: a graphics pipeline layout whose mesh program runs as a compute shader
     /// (its bindings carry VK_SHADER_STAGE_COMPUTE_BIT and so does the push constant range).
     void EnableMeshEmulation() noexcept {

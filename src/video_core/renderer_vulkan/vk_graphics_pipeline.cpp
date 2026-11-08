@@ -87,6 +87,15 @@ VkShaderStageFlagBits SlotStage(size_t index) {
     return stages.at(index);
 }
 
+/// Builder of the layouts a pipeline's libraries share, whose push constant ranges must match.
+DescriptorLayoutBuilder SharedLayoutBuilder(const Device& device, bool mesh) {
+    DescriptorLayoutBuilder builder{device};
+    if (mesh) {
+        builder.EnableMesh();
+    }
+    return builder;
+}
+
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
                                     const std::optional<MeshEmulationSetup>& mesh_emulation = {}) {
     DescriptorLayoutBuilder builder{device};
@@ -388,7 +397,8 @@ GraphicsPipeline::GraphicsPipeline(
             }
         }
         pipeline_layout =
-            DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, true);
+            SharedLayoutBuilder(device, IsMeshPipeline())
+                .CreateIndependentPipelineLayout(set_layouts, true);
     } else {
         DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos, mesh_emulation)};
         // Mesh emulation binds one descriptor set to both the compute dispatch and the draw.
@@ -1358,7 +1368,8 @@ void GraphicsPipeline::FillStates(PipelineStates& s) const {
     if (!vertex_binding_divisors.empty()) {
         s.vertex_input_ci.pNext = &s.input_divisor_ci;
     }
-    const bool has_tess_stages = spv_modules[1] || spv_modules[2];
+    // A mesh program after a task program sits in the tessellation control slot.
+    const bool has_tess_stages = !IsMeshPipeline() && (spv_modules[1] || spv_modules[2]);
     s.has_tess_stages = has_tess_stages;
     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
@@ -1887,7 +1898,8 @@ std::string GraphicsPipeline::ShaderLibraryKey(GplPart part, const PipelineState
     // Same render pass handle = same formats and samples (the render pass cache keeps them).
     key_writer.Add(render_pass);
     key_writer.Add(static_cast<u32>(LibraryFlags(device)));
-    const VkPushConstantRange push_range{DescriptorLayoutBuilder{device}.PushConstantRange()};
+    const VkPushConstantRange push_range{
+        SharedLayoutBuilder(device, IsMeshPipeline()).PushConstantRange()};
     key_writer.Add(push_range.stageFlags);
     key_writer.Add(push_range.offset);
     key_writer.Add(push_range.size);
@@ -2026,7 +2038,8 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
         });
     }
     library.layout =
-        DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, true);
+        SharedLayoutBuilder(device, IsMeshPipeline())
+            .CreateIndependentPipelineLayout(set_layouts, true);
     const bool pre_rasterization = part == GplPart::PreRasterization;
     const VkGraphicsPipelineLibraryCreateInfoEXT library_ci{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
@@ -2063,12 +2076,14 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
 /// Links the vertex input, both shader libraries and the fragment output library into a pipeline,
 /// with link time optimization when `optimized` is set.
 vk::Pipeline GraphicsPipeline::LinkLibraries(VkRenderPass render_pass, bool optimized) {
-    const std::array<VkPipeline, 4> libraries{
-        *vertex_input_library,
-        *shader_libraries[0]->pipeline,
-        *shader_libraries[1]->pipeline,
-        *fragment_output_library,
-    };
+    // Mesh pipelines have no vertex input library.
+    static_vector<VkPipeline, 4> libraries;
+    if (vertex_input_library) {
+        libraries.push_back(*vertex_input_library);
+    }
+    libraries.push_back(*shader_libraries[0]->pipeline);
+    libraries.push_back(*shader_libraries[1]->pipeline);
+    libraries.push_back(*fragment_output_library);
     const VkPipelineLibraryCreateInfoKHR link_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
         .pNext = nullptr,
@@ -2144,27 +2159,29 @@ bool GraphicsPipeline::MakeLibraryPipeline(VkRenderPass render_pass) {
         .pNext = nullptr,
         .flags = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
     };
-    vertex_input_library = device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = &vertex_input_ci,
-        .flags = LibraryFlags(device),
-        .stageCount = 0,
-        .pStages = nullptr,
-        .pVertexInputState = &states.vertex_input_ci,
-        .pInputAssemblyState = &states.input_assembly_ci,
-        .pTessellationState = nullptr,
-        .pViewportState = nullptr,
-        .pRasterizationState = nullptr,
-        .pMultisampleState = nullptr,
-        .pDepthStencilState = nullptr,
-        .pColorBlendState = nullptr,
-        .pDynamicState = &states.dynamic_state_ci,
-        .layout = VK_NULL_HANDLE,
-        .renderPass = VK_NULL_HANDLE,
-        .subpass = 0,
-        .basePipelineHandle = nullptr,
-        .basePipelineIndex = 0,
-    }, *pipeline_cache);
+    if (!states.is_mesh) {
+        vertex_input_library = device.GetLogical().CreateGraphicsPipeline({
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = &vertex_input_ci,
+            .flags = LibraryFlags(device),
+            .stageCount = 0,
+            .pStages = nullptr,
+            .pVertexInputState = &states.vertex_input_ci,
+            .pInputAssemblyState = &states.input_assembly_ci,
+            .pTessellationState = nullptr,
+            .pViewportState = nullptr,
+            .pRasterizationState = nullptr,
+            .pMultisampleState = nullptr,
+            .pDepthStencilState = nullptr,
+            .pColorBlendState = nullptr,
+            .pDynamicState = &states.dynamic_state_ci,
+            .layout = VK_NULL_HANDLE,
+            .renderPass = VK_NULL_HANDLE,
+            .subpass = 0,
+            .basePipelineHandle = nullptr,
+            .basePipelineIndex = 0,
+        }, *pipeline_cache);
+    }
     const VkGraphicsPipelineLibraryCreateInfoEXT fragment_output_ci{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
         .pNext = nullptr,
@@ -2212,7 +2229,8 @@ void GraphicsPipeline::FallBackToMonolithic(VkRenderPass render_pass) {
             stage_set_layouts[stage] ? *stage_set_layouts[stage] : *fallback_empty_set_layout;
     }
     pipeline_layout =
-        DescriptorLayoutBuilder{device}.CreateIndependentPipelineLayout(set_layouts, false);
+        SharedLayoutBuilder(device, IsMeshPipeline())
+            .CreateIndependentPipelineLayout(set_layouts, false);
     shader_libraries = {};
     vertex_input_library.reset();
     fragment_output_library.reset();
