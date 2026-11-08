@@ -15,10 +15,12 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include "common/cityhash.h"
 #include <nlohmann/json.hpp>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
+#include "video_core/pipeline_cache_files.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
@@ -268,6 +270,19 @@ public:
     }
     /// Recorded storage pointer classification, or the bank's guess when guessing is on.
     bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override {
+        if (static_context && !pointers.contains(CbufKey(bank, offset)) && bank == 0 &&
+            offset % 16 == 0) {
+            // Bank 0 holds each stage's storage buffer bindings (address, size) at 16-byte
+            // slots: a program reading one uses a bound storage buffer.
+            pointers.emplace(CbufKey(bank, offset), 1);
+            return true;
+        }
+        if (static_context && !pointers.contains(CbufKey(bank, offset)) && bank == 1) {
+            // Bank 1 is the program's own constant table (jump targets and literals compiled
+            // into the shader), never a GPU address.
+            pointers.emplace(CbufKey(bank, offset), 0);
+            return false;
+        }
         return Find(pointers, CbufKey(bank, offset), "storage pointer classification",
                     u8{bank == 0 ? guesses.storage_pointer : guesses.storage_pointer_other}) != 0;
     }
@@ -279,14 +294,144 @@ public:
     }
     /// Recorded constant buffer value, or the bank's guess when guessing is on.
     u32 ReadCbufValue(u32 bank, u32 offset) override {
+        if (static_context && bank == 1 && !cbuf_values.contains(CbufKey(bank, offset))) {
+            const u32 value =
+                Lookup(static_driver_values, CbufKey(bank, offset), "driver constant (static)");
+            cbuf_values.emplace(CbufKey(bank, offset), value);
+            return value;
+        }
         return Find(cbuf_values, CbufKey(bank, offset), "constant buffer value",
                     bank == 0 ? guesses.cbuf0 : guesses.cbuf_other);
     }
+    /// A texture handle word: with the static context, a placeholder handle (translation needs
+    /// only the bound texture's type, see ReadTextureType below).
+    u32 ReadTextureHandleWord(u32 bank, u32 offset) override {
+        if (static_context && (bank == StaticTextureBank || stage == Stage::Compute) &&
+            bank != 1 && !cbuf_values.contains(CbufKey(bank, offset))) {
+            const u32 handle = StaticHandleBase | (offset / 4);
+            cbuf_values.emplace(CbufKey(bank, offset), handle);
+            return handle;
+        }
+        return ReadCbufValue(bank, offset);
+    }
+    /// Driver bank 1 holds the program's constant table: the code bytes from the offset in
+    /// the control section's word at byte 64 to the end of the allocation.
+    bool SetStaticContext(std::span<const u8> allocation, std::span<const u8> control) {
+        static_context = true;
+        if (control.size() < 68)
+            return false;
+        u32 table{};
+        std::memcpy(&table, control.data() + 64, sizeof(table));
+        if (table % 4 || table >= allocation.size())
+            return false; // no constant table: bank 1 reads stay uncaptured
+        for (size_t at = table; at + 4 <= allocation.size(); at += 4) {
+            u32 word{};
+            std::memcpy(&word, allocation.data() + at, sizeof(word));
+            static_driver_values.emplace(CbufKey(1, static_cast<u32>(at - table)), word);
+        }
+        return true;
+    }
+    /// A compute program's launch parameters sit in its control section: workgroup size at
+    /// bytes 88..99, shared memory at 100 (the driver allocates it in 256-byte units) and
+    /// local memory at 104. Its texture handles are read from bank 0.
+    void SetStaticCompute(std::span<const u8> control) {
+        if (control.size() < 108)
+            throw std::runtime_error("Compute control section is too short");
+        std::array<u32, 5> words{};
+        std::memcpy(words.data(), control.data() + 88, sizeof(words));
+        if (!words[0] || !words[1] || !words[2] || words[0] * words[1] * words[2] > 1024)
+            throw std::runtime_error("Invalid compute workgroup in control section");
+        workgroup = {words[0], words[1], words[2]};
+        shared_memory = (words[3] + 255) & ~255U;
+        local_memory = words[4];
+        if (texture_bound == ~0U)
+            texture_bound = 0;
+    }
     Shader::TextureType ReadTextureType(u32 handle) override {
+        if (static_context && !texture_types.contains(handle)) {
+            // The instruction's own type decides 2D vs array; this answer only separates
+            // rect and buffer textures, which Ocarina's captures never use.
+            texture_types.emplace(handle, Shader::TextureType::Color2D);
+            return Shader::TextureType::Color2D;
+        }
         return Find(texture_types, handle, "texture type",
                     static_cast<Shader::TextureType>(guesses.texture_type));
     }
+    bool CanReadTextureDescriptors() const override {
+        return !static_context;
+    }
+    void NoteInferredTextureType(u32 handle, Shader::TextureType type) override {
+        if (!static_context)
+            return;
+        const auto [it, inserted] = texture_types.emplace(handle, type);
+        if (!inserted && it->second != type)
+            throw MissingContext("Texture handle is used with conflicting types");
+    }
+    /// The record Lichii's pipeline cache stores for this environment
+    /// (GenericEnvironment::Serialize).
+    std::vector<u8> Serialize() const {
+        std::vector<u8> out;
+        const auto put = [&](const auto& value) {
+            const auto* bytes = reinterpret_cast<const u8*>(&value);
+            out.insert(out.end(), bytes, bytes + sizeof(value));
+        };
+        put(u64{code.size() * sizeof(u64)});
+        put(u64{texture_types.size()});
+        put(u64{texture_formats.size()});
+        put(u64{cbuf_values.size()});
+        put(u64{pointers.size()});
+        put(u64{replacements.size()});
+        put(local_memory);
+        put(texture_bound);
+        put(start_address);
+        put(low);
+        put(high);
+        put(viewport);
+        put(static_cast<u32>(stage));
+        const auto* words = reinterpret_cast<const u8*>(code.data());
+        out.insert(out.end(), words, words + code.size() * sizeof(u64));
+        for (const auto& [key, type] : texture_types) {
+            put(key);
+            put(static_cast<u32>(type));
+        }
+        for (const auto& [key, format] : texture_formats) {
+            put(key);
+            put(static_cast<u32>(format));
+        }
+        for (const auto& [key, value] : cbuf_values) {
+            put(key);
+            put(value);
+        }
+        for (const auto& [key, mapped] : pointers) {
+            put(key);
+            put(mapped);
+        }
+        for (const auto& [key, value] : replacements) {
+            put(key);
+            put(static_cast<u32>(value));
+        }
+        if (stage == Stage::Compute) {
+            put(workgroup);
+            put(shared_memory);
+        } else {
+            put(sph);
+        }
+        return out;
+    }
+    std::array<u32, 3> Workgroup() const {
+        return workgroup;
+    }
+    u32 SharedMemory() const {
+        return shared_memory;
+    }
+    u64 assumed_formats{};
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        if (static_context && !texture_formats.contains(handle)) {
+            // Ocarina's captures bind no integer textures or images (0 of 150 compute programs).
+            ++assumed_formats;
+            texture_formats.emplace(handle, Shader::TexturePixelFormat::A8B8G8R8_UNORM);
+            return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
+        }
         return Find(texture_formats, handle, "texture pixel format",
                     static_cast<Shader::TexturePixelFormat>(guesses.pixel_format));
     }
@@ -321,6 +466,8 @@ public:
         return viewport;
     }
     u32 TextureBoundBuffer() const override {
+        if (texture_bound == ~0U && static_context)
+            return StaticTextureBank;
         if (texture_bound == ~0U)
             throw MissingContext("Uncaptured texture-bound constant buffer");
         return texture_bound;
@@ -365,6 +512,10 @@ private:
     std::map<u64, u32> cbuf_values;
     std::map<u64, u8> pointers;
     std::map<u64, Shader::ReplaceConstant> replacements;
+    std::map<u64, u32> static_driver_values;
+    bool static_context{};
+    static constexpr u32 StaticTextureBank = 2;
+    static constexpr u32 StaticHandleBase = 0x00F00000;
 };
 
 template <typename T>
@@ -572,7 +723,8 @@ int main(int argc, char** argv) {
         if constexpr (std::endian::native != std::endian::little) {
             throw std::runtime_error("Only little-endian hosts are supported");
         }
-        std::string input, output, environment, pipeline_key, override_out,
+        std::string input, output, environment, pipeline_key, control, allocation, cache_record,
+            override_out,
             format{"instructions"};
         std::optional<Stage> requested_stage;
         u32 version{};
@@ -587,11 +739,12 @@ int main(int argc, char** argv) {
                 std::cout << "shader-sweep [INPUT] [--stage "
                              "vertex|tess-control|tess-eval|geometry|fragment|compute|task|mesh]\n"
                              "  [--format instructions|native-header] [--environment FILE "
-                             "--cache-version 46|47|48|49|50|51|52|53]\n"
+                             "--cache-version 46|47|48|49|50|51|52|53|54]\n"
                              "  [--guess-missing [--guess-cbuf0 HEX] [--guess-cbuf-other HEX]\n"
                              "   [--guess-texture-type N] [--guess-pixel-format N] "
                              "[--guess-storage-pointer 0|1]\n"
                              "   [--guess-storage-pointer-other 0|1]]\n"
+                             "  [--control FILE [--allocation FILE] [--cache-record FILE]]\n"
                              "  [--pipeline-key FILE] [--capture-extent] [--override-out FILE] "
                              "(--output SPV | --lower-only WORDS | --packed-code WORDS)\n";
                 return 0;
@@ -623,6 +776,12 @@ int main(int argc, char** argv) {
                 override_out = value;
             else if (arg == "--pipeline-key")
                 pipeline_key = value;
+            else if (arg == "--control")
+                control = value;
+            else if (arg == "--allocation")
+                allocation = value;
+            else if (arg == "--cache-record")
+                cache_record = value;
             else if (arg == "--guess-cbuf0")
                 guesses.cbuf0 = static_cast<u32>(std::stoul(value, nullptr, 16));
             else if (arg == "--guess-cbuf-other")
@@ -648,8 +807,8 @@ int main(int argc, char** argv) {
                 storage_pointer_other_set = true;
             } else if (arg == "--cache-version") {
                 if (value != "46" && value != "47" && value != "48" && value != "49" && value != "50" &&
-                    value != "51" && value != "52" && value != "53")
-                    throw std::runtime_error("Expected cache version 46 to 53");
+                    value != "51" && value != "52" && value != "53" && value != "54")
+                    throw std::runtime_error("Expected cache version 46 to 54");
                 version = static_cast<u32>(std::stoul(value));
             } else if (arg == "--output" || arg == "--lower-only" || arg == "--packed-code") {
                 if (!output.empty())
@@ -709,6 +868,14 @@ int main(int argc, char** argv) {
                 }
                 env.SetStage(stage);
                 env.SetHeader(bytes);
+                if (!control.empty()) {
+                    diagnostic["static_context"] = env.SetStaticContext(bytes, ReadFile(control));
+                }
+            } else if (!control.empty() && env.ShaderStage() == Stage::Compute) {
+                // The constant table lies past the declared code: read it from the allocation.
+                diagnostic["static_context"] = env.SetStaticContext(
+                    allocation.empty() ? bytes : ReadFile(allocation), ReadFile(control));
+                env.SetStaticCompute(ReadFile(control));
             } else if (!requested_stage && !env.captured && !lower_only) {
                 throw std::runtime_error(
                     "Instruction-only input requires --stage or a captured environment");
@@ -821,44 +988,79 @@ int main(int argc, char** argv) {
         diagnostic["assumptions"].push_back(
             "Offline SPIR-V 1.4 profile; no device feature probing, default shader settings, no "
             "resolution scaling");
+        const auto compile = [&](OfflineEnvironment& source) {
+            Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+            Shader::Maxwell::Flow::CFG cfg{source, flow_pool, Shader::Maxwell::Location{source.EntryPoint()}};
+            Shader::ObjectPool<Shader::IR::Inst> inst_pool;
+            Shader::ObjectPool<Shader::IR::Block> block_pool;
+            Shader::HostTranslateInfo host{};
+            host.support_float64 = true;
+            host.support_float16 = true;
+            host.support_int64 = true;
+            host.support_conditional_barrier = true;
+            host.support_viewport_index_layer = true;
+            host.support_geometry_shader_passthrough = true;
+            host.ApplyDescriptorLimitPolicy();
+            auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, source, cfg, host);
+            auto info = runtime;
+            Shader::Maxwell::ConvertLegacyToGeneric(program, info);
+            Shader::Profile profile{};
+            profile.supported_spirv = 0x00010400;
+            profile.unified_descriptor_binding = true;
+            profile.min_ssbo_alignment = host.min_ssbo_alignment;
+            profile.support_int64 = true;
+            profile.support_int16 = true;
+            profile.support_int8 = true;
+            profile.support_vote = true;
+            profile.support_shuffle_relative = true;
+            profile.support_geometry_streams = true;
+            profile.support_geometry_shader_passthrough = true;
+            profile.support_viewport_index_layer_non_geometry = true;
+            profile.support_multi_viewport = true;
+            profile.max_user_clip_distances = 8;
+            profile.max_subgroup_size = 32;
+            profile.support_typeless_image_loads = true;
+            Shader::Backend::Bindings bindings{};
+            return Shader::Backend::SPIRV::EmitSPIRV(profile, info, program, bindings);
+        };
         diagnostic["phase"] = "translate";
-        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-        Shader::Maxwell::Flow::CFG cfg{env, flow_pool, Shader::Maxwell::Location{env.EntryPoint()}};
-        Shader::ObjectPool<Shader::IR::Inst> inst_pool;
-        Shader::ObjectPool<Shader::IR::Block> block_pool;
-        Shader::HostTranslateInfo host{};
-        host.support_float64 = true;
-        host.support_float16 = true;
-        host.support_int64 = true;
-        host.support_conditional_barrier = true;
-        host.support_viewport_index_layer = true;
-        host.support_geometry_shader_passthrough = true;
-        host.ApplyDescriptorLimitPolicy();
-        auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
-        Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
-        diagnostic["phase"] = "spirv";
-        Shader::Profile profile{};
-        profile.supported_spirv = 0x00010400;
-        profile.unified_descriptor_binding = true;
-        profile.min_ssbo_alignment = host.min_ssbo_alignment;
-        profile.support_int64 = true;
-        profile.support_int16 = true;
-        profile.support_int8 = true;
-        profile.support_vote = true;
-        profile.support_shuffle_relative = true;
-        profile.support_geometry_streams = true;
-        profile.support_geometry_shader_passthrough = true;
-        profile.support_viewport_index_layer_non_geometry = true;
-        profile.support_multi_viewport = true;
-        profile.max_user_clip_distances = 8;
-        profile.max_subgroup_size = 32;
-        profile.support_typeless_image_loads = true;
-        Shader::Backend::Bindings bindings{};
-        const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
-        diagnostic["spirv_words"] = spirv.size();
+        diagnostic["native_hash"] =
+            fmt::format("{:016x}", Common::CityHash64(reinterpret_cast<const char*>(env.code.data()),
+                                                      env.code.size() * sizeof(u64)) ^
+                                       0x4f554e4345000002ULL);
+        const auto spirv = compile(env);
+        if (!cache_record.empty()) {
+            // The record Lichii loads at boot: it must reproduce this translation by itself.
+            diagnostic["phase"] = "cache-record";
+            if (env.ShaderStage() != Stage::Compute || env.captured)
+                throw std::runtime_error("Cache records are written for static compute programs");
+            const auto record_env = env.Serialize();
+            OfflineEnvironment reloaded;
+            reloaded.Load(record_env, VideoCommon::VulkanPipelineCacheVersion);
+            if (compile(reloaded) != spirv)
+                throw MissingContext("Cache record does not reproduce the static translation");
+            const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(env.code.data()),
+                                                env.code.size() * sizeof(u64)) ^
+                             0x4f554e4345000002ULL;
+            std::vector<u8> record(sizeof(u32));
+            record[0] = 1; // one environment
+            record.insert(record.end(), record_env.begin(), record_env.end());
+            const auto put = [&](const auto& value) {
+                const auto* bytes = reinterpret_cast<const u8*>(&value);
+                record.insert(record.end(), bytes, bytes + sizeof(value));
+            };
+            put(hash);                // ComputePipelineCacheKey::unique_hash
+            put(env.SharedMemory());  // shared_memory_size
+            put(env.Workgroup());     // workgroup_size
+            WriteFile(cache_record, record);
+            diagnostic["cache_record"] = {{"unique_hash", fmt::format("{:016x}", hash)},
+                                          {"assumed_pixel_formats", env.assumed_formats},
+                                          {"bytes", record.size()}};
+        }
         if (guesses.enabled)
             diagnostic["guessed_reads"] = env.guessed_reads;
         diagnostic["phase"] = "output";
+        diagnostic["spirv_words"] = spirv.size();
         WriteFile(output, spirv);
         diagnostic["status"] = "ok";
         std::cout << diagnostic.dump() << '\n';

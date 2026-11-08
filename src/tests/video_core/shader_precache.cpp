@@ -135,7 +135,7 @@ TEST_CASE("ShaderPrecache: a compute entry reads back like a pipeline cache entr
     lowered.texture_buffer = 3;
     const ShaderWarm::ComputeControl control{{64, 2, 1}, 1024, 256};
     ShaderWarm::ComputeKey key_bytes{};
-    const auto entry = ShaderWarm::ComputeEntry(lowered, control, key_bytes);
+    const auto entry = ShaderWarm::ComputeEntry(lowered, control, {}, key_bytes);
 
     TempDir dir;
     const auto file = dir.path / "entry.bin";
@@ -178,7 +178,7 @@ TEST_CASE("ShaderPrecache: a program naming no texture bank reads bank 0", "[vid
     ShaderWarm::LoweredCode lowered;
     lowered.code.resize(16 * sizeof(u64));
     ShaderWarm::ComputeKey key{};
-    const auto entry = ShaderWarm::ComputeEntry(lowered, {{1, 1, 1}, 0, 0}, key);
+    const auto entry = ShaderWarm::ComputeEntry(lowered, {{1, 1, 1}, 0, 0}, {}, key);
     u32 texture_bound{};
     // num_envs, then six u64 counts and local memory before the texture bank.
     std::memcpy(&texture_bound, entry.data() + 4 + 6 * 8 + 4, sizeof(texture_bound));

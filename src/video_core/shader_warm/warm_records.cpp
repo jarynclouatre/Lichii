@@ -38,6 +38,14 @@ T Get(std::span<const u8> data, size_t offset) {
     return value;
 }
 
+/// Records the constant table as the bank 1 values the driver binds (cbuf key, value).
+void PutConstantTable(std::vector<u8>& out, std::span<const u8> constants) {
+    for (size_t offset = 0; offset + 4 <= constants.size(); offset += 4) {
+        Put<u64>(out, (u64{1} << 32) | offset);
+        Put<u32>(out, Get<u32>(constants, offset));
+    }
+}
+
 /// The GenericEnvironment::Serialize header: six u64 counts and seven u32 fields.
 void PutEnvHeader(std::vector<u8>& out, u64 code_size, u64 cbuf_count, u32 local_memory,
                   u32 texture_bound, u32 start_address, u32 stage) {
@@ -181,15 +189,17 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control) {
 }
 
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
-                             ComputeKey& key) {
+                             std::span<const u8> constants, ComputeKey& key) {
+    const size_t cbuf_count = constants.size() / 4;
     std::vector<u8> out;
-    out.reserve(4 + EnvHeaderSize + lowered.code.size() + 16 + key.size());
+    out.reserve(4 + EnvHeaderSize + lowered.code.size() + cbuf_count * 12 + 16 + key.size());
     Put<u32>(out, 1);
     // Like InitializeNativeCode: the program's own bank when it names one.
     const u32 texture_bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer : 0;
-    PutEnvHeader(out, lowered.code.size(), 0, control.local_memory, texture_bound, 80,
+    PutEnvHeader(out, lowered.code.size(), cbuf_count, control.local_memory, texture_bound, 80,
                  ComputeStage);
     PutBytes(out, lowered.code);
+    PutConstantTable(out, constants);
     for (const u32 size : control.workgroup) {
         Put<u32>(out, size);
     }
@@ -205,13 +215,12 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
     return out;
 }
 
-std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program) {
+std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program,
+                            std::span<const u8> constants) {
     const auto sph = program.first(80);
     const u32 bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer
                                                      : (stage == 0 ? 0U : 2U);
-    // Constant buffer bank 1 = the last 256 bytes of the program allocation.
-    const auto bank1 = program.last(std::min<size_t>(256, program.size()));
-    const size_t cbuf_count = (bank1.size() & ~size_t{3}) / 4;
+    const size_t cbuf_count = constants.size() / 4;
     const u32 w1 = Get<u32>(sph, 4), w2 = Get<u32>(sph, 8), w3 = Get<u32>(sph, 12);
     const u64 local_memory =
         ((u64{w1} & 0xFFFFFF) | ((u64{w2} & 0xFFFFFF) << 24)) + (u64{w3} & 0xFFFFFF);
@@ -220,10 +229,7 @@ std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<con
     PutEnvHeader(out, lowered.code.size(), cbuf_count, static_cast<u32>(local_memory), bound, 0,
                  stage);
     PutBytes(out, lowered.code);
-    for (size_t i = 0; i < cbuf_count; ++i) {
-        Put<u64>(out, (u64{1} << 32) | (i * 4));
-        Put<u32>(out, Get<u32>(bank1, i * 4));
-    }
+    PutConstantTable(out, constants);
     PutBytes(out, sph);
     return out;
 }

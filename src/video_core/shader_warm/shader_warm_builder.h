@@ -45,6 +45,15 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 /// file of another size.
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
+/// Revision of what the builder writes into warm files, recorded after the entry count and
+/// size. 1: bank 1 is the program's own constant table (before: the last 256 bytes of a graphics
+/// allocation, none for compute).
+constexpr u32 WarmFormat = 1;
+
+/// True when the builder wrote `warm_file` with an older WarmFormat (files from the offline
+/// tools have no count file and are not reported).
+bool WarmFileOutdated(const std::filesystem::path& warm_file);
+
 /// What a marker records: the precache file's size and last-write time, its entry count, the GPU
 /// driver version and device ID, the pipeline cache version and whether shared shader functions
 /// were built as calls (compute bit 0, graphics bit 1: the SPIR-V the driver compiled differs).

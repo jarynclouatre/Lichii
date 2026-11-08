@@ -40,7 +40,7 @@ def pipeline_cache(version):
 class CacheTests(unittest.TestCase):
     def test_supported_versions_preserve_records_and_stage(self):
         """Verify ordinary record layouts stay compatible across supported versions."""
-        for version in (46, 47, 48, 49, 50, 51, 52, 53):
+        for version in (46, 47, 48, 49, 50, 51, 52, 53, 54):
             records = list(sweep.parse_cache(pipeline_cache(version)))
             self.assertEqual([r["stage"] for r in records], ["vertex", "geometry", "fragment", "compute"])
             for record, stage in zip(records, (0, 3, 4, 5)):
@@ -78,7 +78,7 @@ class CacheTests(unittest.TestCase):
 
     def test_unknown_version_and_environment_count_rejected(self):
         """Reject unsupported versions and out-of-range stage counts."""
-        for data in (b"yuzucach" + struct.pack("<I", 54),
+        for data in (b"yuzucach" + struct.pack("<I", 55),
                      b"yuzucach" + struct.pack("<II", 47, 7)):
             with self.assertRaises(sweep.CacheError):
                 list(sweep.parse_cache(data))

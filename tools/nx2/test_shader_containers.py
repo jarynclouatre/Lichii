@@ -75,6 +75,28 @@ class SharcbTests(unittest.TestCase):
             self.assertEqual(item["stage"], "compute")
             self.assertEqual(item["code"], bytes(range(16)))
 
+    def test_constant_table_follows_instruction_allocation(self):
+        """Keep the driver constant table that the control section places after the code."""
+        for slot in (0, 3):
+            with self.subTest(slot=slot):
+                data, _, _, control = sharcb(slot)
+                pool = struct.unpack_from("<I", data, 28)[0]
+                declared = struct.unpack_from("<I", data, control + 56)[0]
+                struct.pack_into("<II", data, control + 60, 8, 0xc0)
+                struct.pack_into("<II", data, pool + 0xc0, 0x1234, 0x5678)
+                for item in parse_sharcb(data):
+                    self.assertEqual(len(item["code"]), 0xd0)
+                    self.assertEqual(item["code"][:declared], bytes(data[pool:pool + declared]))
+                    self.assertEqual(struct.unpack_from("<II", item["code"], 0xc0), (0x1234, 0x5678))
+
+    def test_constant_table_that_does_not_fit_is_left_out(self):
+        """Read the program without a constant table that runs past the allocation."""
+        data, _, _, control = sharcb(0)
+        instruction_allocation = struct.unpack_from("<I", data, control + 64)[0]
+        struct.pack_into("<I", data, control + 60, 0x10000)
+        for item in parse_sharcb(data):
+            self.assertEqual(len(item["code"]), instruction_allocation)
+
     def test_rejects_cross_pool_or_invalid_control(self):
         """Reject descriptors that leave their pools or disagree with the stage."""
         data, first, second, control = sharcb()

@@ -12,6 +12,7 @@
 #include <bit>
 #include <optional>
 #include "common/container/unordered_map.h"
+#include <map>
 #include <tuple>
 #include <limits>
 #include <boost/container/small_vector.hpp>
@@ -328,6 +329,15 @@ static inline u32 ReadCbufCached(Environment& env, u32 index, u32 offset) {
     return v;
 }
 
+static inline u32 ReadHandleWordCached(Environment& env, u32 index, u32 offset) {
+    const CbufWordKey k{index, offset};
+    if (auto it = env.cbuf_word_cache.find(k); it != env.cbuf_word_cache.end())
+        return it->second;
+    const u32 v = env.ReadTextureHandleWord(index, offset);
+    env.cbuf_word_cache.emplace(k, v);
+    return v;
+}
+
 static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr& cbuf) {
     // Must all be uniquely different variables
     // If has secondary, then it will be cbuf.secondary_{index|offset}, else its 0.
@@ -338,8 +348,8 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
         return it->second;
     const u32 sec_idx = cbuf.has_secondary ? cbuf.secondary_index  : cbuf.index;
     const u32 sec_off = cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset;
-    const u32 lhs = ReadCbufCached(env, cbuf.index, cbuf.offset) << cbuf.shift_left;
-    const u32 rhs = ReadCbufCached(env, sec_idx, sec_off) << cbuf.secondary_shift_left;
+    const u32 lhs = ReadHandleWordCached(env, cbuf.index, cbuf.offset) << cbuf.shift_left;
+    const u32 rhs = ReadHandleWordCached(env, sec_idx, sec_off) << cbuf.secondary_shift_left;
     const u32 handle = lhs | rhs;
     env.handle_cache.emplace(hk, handle);
     return handle;
@@ -990,8 +1000,8 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
 u32 GetTextureHandle(Environment& env, const ConstBufferAddr& cbuf) {
     const u32 secondary_index{cbuf.has_secondary ? cbuf.secondary_index : cbuf.index};
     const u32 secondary_offset{cbuf.has_secondary ? cbuf.secondary_offset : cbuf.offset};
-    const u32 lhs_raw{env.ReadCbufValue(cbuf.index, cbuf.offset) << cbuf.shift_left};
-    const u32 rhs_raw{env.ReadCbufValue(secondary_index, secondary_offset)
+    const u32 lhs_raw{env.ReadTextureHandleWord(cbuf.index, cbuf.offset) << cbuf.shift_left};
+    const u32 rhs_raw{env.ReadTextureHandleWord(secondary_index, secondary_offset)
                       << cbuf.secondary_shift_left};
     return lhs_raw | rhs_raw;
 }
@@ -1212,13 +1222,23 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     // A handle program has no descriptor to read a type from, and ImageQueryDimensions carries
     // none: it takes the type of another instruction using the same handle.
     std::unordered_map<u32, TextureType> handle_program_types;
+    // Without descriptors, a query takes the type of a sampling instruction on the same handle.
+    const auto handle_slot = [](const ConstBufferAddr& addr) {
+        return std::tuple{addr.index, addr.offset, addr.shift_left, addr.has_secondary,
+                          addr.secondary_index, addr.secondary_offset, addr.secondary_shift_left};
+    };
+    std::map<decltype(handle_slot(ConstBufferAddr{})), TextureType> slot_types;
+    const bool has_descriptors{env.CanReadTextureDescriptors()};
     for (const TextureInst& texture_inst : to_replace) {
         const IR::Opcode opcode{IndexedInstruction(*texture_inst.inst)};
-        if (texture_inst.cbuf.handle_program != ~0U && opcode != IR::Opcode::ImageQueryDimensions &&
-            !IsStorageImageOpcode(opcode)) {
-            handle_program_types.try_emplace(
-                texture_inst.cbuf.handle_program,
-                texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value());
+        if (opcode == IR::Opcode::ImageQueryDimensions || IsStorageImageOpcode(opcode)) {
+            continue;
+        }
+        const TextureType type{texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value()};
+        if (texture_inst.cbuf.handle_program != ~0U) {
+            handle_program_types.try_emplace(texture_inst.cbuf.handle_program, type);
+        } else if (!has_descriptors && texture_inst.cbuf.count == 1) {
+            slot_types.try_emplace(handle_slot(texture_inst.cbuf), type);
         }
     }
     for (TextureInst& texture_inst : to_replace) {
@@ -1235,6 +1255,15 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (const auto it{handle_program_types.find(cbuf.handle_program)};
                 it != handle_program_types.end()) {
                 flags.type.Assign(it->second);
+            } else if (!has_descriptors) {
+                const auto slot{slot_types.find(handle_slot(cbuf))};
+                if (cbuf.handle_program != ~0U || slot == slot_types.end()) {
+                    throw NotImplementedException(
+                        "Texture query type needs a descriptor (cbuf {} offset {:#x})", cbuf.index,
+                        cbuf.offset);
+                }
+                flags.type.Assign(slot->second);
+                env.NoteInferredTextureType(GetTextureHandleCached(env, cbuf), slot->second);
             } else {
                 flags.type.Assign(ReadTextureTypeCached(env, cbuf));
             }

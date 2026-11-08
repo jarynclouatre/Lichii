@@ -106,7 +106,20 @@ public:
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
+    /// A constant buffer word read as (part of) a texture handle by the texture pass.
+    [[nodiscard]] virtual u32 ReadTextureHandleWord(u32 cbuf_index, u32 cbuf_offset) {
+        return ReadCbufValue(cbuf_index, cbuf_offset);
+    }
+
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
+
+    /// False when texture descriptors are unavailable (translation ahead of time, before any
+    /// draw binds them): types then come from the program's own texture instructions.
+    [[nodiscard]] virtual bool CanReadTextureDescriptors() const { return true; }
+
+    /// Without descriptors, reports a type taken from the program's own texture instructions,
+    /// so an ahead-of-time environment can store it as that handle's descriptor type.
+    virtual void NoteInferredTextureType(u32 raw_handle, TextureType type) {}
 
     [[nodiscard]] virtual TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) = 0;
 

@@ -117,6 +117,9 @@ struct ComputePipelineCacheEntry {
     std::vector<std::pair<u32, u32>> null_pointer_slots;
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
+    /// Built at boot from the game files: the environment whose rule answers the first dispatch
+    /// checks (FileEnvironment::CheckDispatch) before the pipeline is kept and cached.
+    std::unique_ptr<VideoCommon::FileEnvironment> prebuilt;
     u32 rebuilds{};
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
@@ -191,11 +194,10 @@ private:
                                                     const ShaderInfo* shader,
                                                     std::span<const u64> keep_pointers = {});
 
-    ComputePipelineCacheEntry CreateComputePipeline(ShaderPools& pools,
-                                                     const ComputePipelineCacheKey& key,
-                                                     Shader::Environment& env,
-                                                     PipelineStatistics* statistics,
-                                                     bool build_in_parallel);
+    ComputePipelineCacheEntry CreateComputePipeline(
+        ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
+        PipelineStatistics* statistics, bool build_in_parallel,
+        const VideoCommon::FileEnvironment* exact_context = nullptr);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);

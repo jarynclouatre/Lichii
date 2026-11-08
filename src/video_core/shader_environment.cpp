@@ -1199,6 +1199,7 @@ void FileEnvironment::Deserialize(std::ifstream& file, std::streampos end) {
     claim(num_cbuf_values, sizeof(u64) + sizeof(u32));
     claim(num_storage_pointer_types, sizeof(u64) + sizeof(u8));
     claim(num_cbuf_replacement_values, sizeof(u64) + sizeof(Shader::ReplaceConstant));
+    code_size_bytes = code_size;
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
     for (size_t i = 0; i < num_texture_types; ++i) {
@@ -1260,6 +1261,69 @@ void FileEnvironment::Deserialize(std::ifstream& file, std::streampos end) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
+void FileEnvironment::Serialize(std::ofstream& file, u32 read_properties) const {
+    const u64 num_texture_types{texture_types.size()};
+    const u64 num_texture_pixel_formats{texture_pixel_formats.size()};
+    const u64 num_cbuf_values{cbuf_values.size() + 1};
+    const u64 num_storage_pointer_types{storage_pointer_types.size()};
+    const u64 num_cbuf_replacement_values{cbuf_replacements.size()};
+    file.write(reinterpret_cast<const char*>(&code_size_bytes), sizeof(code_size_bytes))
+        .write(reinterpret_cast<const char*>(&num_texture_types), sizeof(num_texture_types))
+        .write(reinterpret_cast<const char*>(&num_texture_pixel_formats),
+               sizeof(num_texture_pixel_formats))
+        .write(reinterpret_cast<const char*>(&num_cbuf_values), sizeof(num_cbuf_values))
+        .write(reinterpret_cast<const char*>(&num_storage_pointer_types),
+               sizeof(num_storage_pointer_types))
+        .write(reinterpret_cast<const char*>(&num_cbuf_replacement_values),
+               sizeof(num_cbuf_replacement_values))
+        .write(reinterpret_cast<const char*>(&local_memory_size), sizeof(local_memory_size))
+        .write(reinterpret_cast<const char*>(&texture_bound), sizeof(texture_bound))
+        .write(reinterpret_cast<const char*>(&start_address), sizeof(start_address))
+        .write(reinterpret_cast<const char*>(&read_lowest), sizeof(read_lowest))
+        .write(reinterpret_cast<const char*>(&read_highest), sizeof(read_highest))
+        .write(reinterpret_cast<const char*>(&viewport_transform_state),
+               sizeof(viewport_transform_state))
+        .write(reinterpret_cast<const char*>(&stage), sizeof(stage))
+        .write(reinterpret_cast<const char*>(code.data()), code_size_bytes);
+    for (const auto& [key, type] : texture_types) {
+        file.write(reinterpret_cast<const char*>(&key), sizeof(key))
+            .write(reinterpret_cast<const char*>(&type), sizeof(type));
+    }
+    for (const auto& [key, format] : texture_pixel_formats) {
+        file.write(reinterpret_cast<const char*>(&key), sizeof(key))
+            .write(reinterpret_cast<const char*>(&format), sizeof(format));
+    }
+    for (const auto& [key, value] : cbuf_values) {
+        file.write(reinterpret_cast<const char*>(&key), sizeof(key))
+            .write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    file.write(reinterpret_cast<const char*>(&READ_PROPERTIES_KEY), sizeof(READ_PROPERTIES_KEY))
+        .write(reinterpret_cast<const char*>(&read_properties), sizeof(read_properties));
+    for (const auto& [key, value] : storage_pointer_types) {
+        file.write(reinterpret_cast<const char*>(&key), sizeof(key))
+            .write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    for (const auto& [key, value] : cbuf_replacements) {
+        file.write(reinterpret_cast<const char*>(&key), sizeof(key))
+            .write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+    if (stage == Shader::Stage::Compute) {
+        file.write(reinterpret_cast<const char*>(&workgroup_size), sizeof(workgroup_size))
+            .write(reinterpret_cast<const char*>(&shared_memory_size), sizeof(shared_memory_size));
+    } else {
+        file.write(reinterpret_cast<const char*>(&sph), sizeof(sph));
+        if (stage == Shader::Stage::Geometry) {
+            file.write(reinterpret_cast<const char*>(&gp_passthrough_mask),
+                       sizeof(gp_passthrough_mask));
+        }
+        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
+            file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
+                .write(reinterpret_cast<const char*>(&mesh_primitive_header),
+                       sizeof(mesh_primitive_header));
+        }
+    }
+}
+
 size_t FileEnvironment::MemorySize() const {
     const auto map_bytes = [](const auto& map) {
         return (map.bucket_count() + 1) *
@@ -1298,7 +1362,16 @@ std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {
 bool FileEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     const auto it = storage_pointer_types.find(MakeCbufKey(index, offset));
     if (it == storage_pointer_types.end()) {
+        // Bank 0 holds each stage's storage buffer bindings at 16-byte slots; bank 1 is the
+        // program's constant table, never an address.
+        if (static_context && ((index == 0 && offset % 16 == 0) || index == 1)) {
+            const bool mapped = index == 0;
+            storage_pointer_types.emplace(MakeCbufKey(index, offset), static_cast<u8>(mapped));
+            rule_pointers.push_back(MakeCbufKey(index, offset));
+            return mapped;
+        }
         if (guess) {
+            ++inexact_reads;
             return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
         }
         lacks_recorded_value = true;
@@ -1312,6 +1385,7 @@ bool FileEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, 
     const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
     if (it == storage_pointer_types.end()) {
         if (guess) {
+            ++inexact_reads;
             return index == 0 ? guess->storage_pointer_bank0 : guess->storage_pointer_other;
         }
         lacks_recorded_value = true;
@@ -1330,22 +1404,49 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
 /// Recorded constant buffer value at `cbuf_index`/`cbuf_offset`. Without a record, the guess when
 /// one is set, else throws.
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    const auto it{cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset))};
+    const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
+    const auto it{cbuf_values.find(key)};
     if (it == cbuf_values.end()) {
         if (guess) {
+            ++inexact_reads;
             return cbuf_index == 0 ? guess->cbuf_bank0 : guess->cbuf_other;
         }
         lacks_recorded_value = true;
-        throw Shader::LogicError("Uncached read texture type");
+        throw Shader::LogicError("Uncached read constant buffer value");
+    }
+    if (static_context && cbuf_index == 1) {
+        table_reads.push_back(key);
     }
     return it->second;
+}
+
+/// A texture handle word the draw or dispatch binds: without a record, a placeholder handle,
+/// since translation needs only the bound texture's type (checked by CheckDispatch).
+u32 FileEnvironment::ReadTextureHandleWord(u32 cbuf_index, u32 cbuf_offset) {
+    const u64 key = MakeCbufKey(cbuf_index, cbuf_offset);
+    if (static_context && cbuf_index != 1 && !cbuf_values.contains(key) &&
+        (cbuf_index == 2 || stage == Shader::Stage::Compute)) {
+        const u32 handle = 0x00F00000U | (cbuf_offset / 4);
+        cbuf_values.emplace(key, handle);
+        handle_words.push_back(key);
+        return handle;
+    }
+    return ReadCbufValue(cbuf_index, cbuf_offset);
 }
 
 /// Recorded texture type of `handle`. Without a record, the guess when one is set, else throws.
 Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
     const auto it{texture_types.find(handle)};
     if (it == texture_types.end()) {
+        // The instruction's own type decides 2D vs array; this only tells rect and buffer
+        // textures apart (checked by CheckDispatch).
+        if (static_context) {
+            texture_types.emplace(handle, Shader::TextureType::Color2D);
+            typed_handles.try_emplace(handle, false);
+            return Shader::TextureType::Color2D;
+        }
         if (guess) {
+            ++inexact_reads;
             return guess->texture_type;
         }
         lacks_recorded_value = true;
@@ -1359,13 +1460,156 @@ Shader::TextureType FileEnvironment::ReadTextureType(u32 handle) {
 Shader::TexturePixelFormat FileEnvironment::ReadTexturePixelFormat(u32 handle) {
     const auto it{texture_pixel_formats.find(handle)};
     if (it == texture_pixel_formats.end()) {
+        // Not in the program: recorded programs of Ocarina of Time bind no integer formats,
+        // but this stays an assumption.
+        if (static_context) {
+            ++inexact_reads;
+            const auto format = static_cast<Shader::TexturePixelFormat>(
+                VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM);
+            texture_pixel_formats.emplace(handle, format);
+            return format;
+        }
         if (guess) {
+            ++inexact_reads;
             return guess->pixel_format;
         }
         lacks_recorded_value = true;
         throw Shader::LogicError("Uncached read texture pixel format");
     }
     return it->second;
+}
+
+void FileEnvironment::NoteInferredTextureType(u32 handle, Shader::TextureType type) {
+    if (!static_context) {
+        return;
+    }
+    const auto [it, inserted] = texture_types.emplace(handle, type);
+    if (!inserted && it->second != type) {
+        throw Shader::LogicError("Texture handle used with conflicting types");
+    }
+    typed_handles[handle] = true;
+}
+
+size_t FileEnvironment::InexactReads() const {
+    size_t inexact = inexact_reads;
+    // CheckDispatch finds the word of a typed handle by its placeholder value: a handle combined
+    // from several words, or one whose placeholder is shared, cannot be compared.
+    for (const auto& [handle, exact] : typed_handles) {
+        const auto matches = std::ranges::count_if(handle_words, [&](u64 key) {
+            return cbuf_values.at(key) == handle;
+        });
+        if (matches != 1) {
+            ++inexact;
+        }
+    }
+    return inexact;
+}
+
+bool FileEnvironment::CheckDispatch(Tegra::Engines::KeplerCompute& kepler_compute,
+                                    Tegra::MemoryManager& gpu_memory, u32 texture_bank,
+                                    std::string& mismatch) {
+    const auto& qmd{kepler_compute.launch_description};
+    const auto& regs{kepler_compute.regs};
+    // Same reads as ComputeEnvironment::ReadCbufValue; empty for a bank the dispatch disables.
+    const auto word = [&](u64 key) -> std::optional<u32> {
+        const u32 index = static_cast<u32>(key >> 32);
+        const u32 offset = static_cast<u32>(key);
+        if (index >= qmd.const_buffer_config.size() ||
+            ((qmd.const_buffer_enable_mask.Value() >> index) & 1) == 0) {
+            return std::nullopt;
+        }
+        const auto& cbuf{qmd.const_buffer_config[index]};
+        return offset < cbuf.size ? gpu_memory.Read<u32>(cbuf.Address() + offset) : 0U;
+    };
+    const auto fail = [&](std::string reason) {
+        mismatch = std::move(reason);
+        return false;
+    };
+    if (const u32 local = qmd.local_pos_alloc + qmd.local_crs_alloc; local != local_memory_size) {
+        return fail(fmt::format("local memory {} instead of {}", local, local_memory_size));
+    }
+    if (texture_bank != texture_bound) {
+        return fail(fmt::format("texture bank {} instead of {}", texture_bank, texture_bound));
+    }
+    for (const u64 key : table_reads) {
+        const auto value = word(key);
+        if (!value || *value != cbuf_values.at(key)) {
+            return fail(fmt::format("c1[{:#x}] is not the program's constant", static_cast<u32>(key)));
+        }
+    }
+    // Same classification as GenericEnvironment::IsCbufStorageBufferPointer.
+    for (const u64 key : rule_pointers) {
+        const auto low = word(key);
+        const auto high = word(key + 4);
+        if (!low || !high) {
+            return fail(fmt::format("c{} is not bound", key >> 32));
+        }
+        const u64 address = u64{*low} | (u64{*high} << 32);
+        const bool mapped = address != 0 && gpu_memory.IsWithinGPUAddressRange(address) &&
+                            gpu_memory.IsFullyMappedRange(address, 1);
+        if (mapped != (storage_pointer_types.at(key) != 0)) {
+            return fail(fmt::format("c{}[{:#x}] is {}a storage buffer pointer", key >> 32,
+                                    static_cast<u32>(key), mapped ? "" : "not "));
+        }
+    }
+    ::Common::unordered_map<u64, u32> live_words;
+    for (const u64 key : handle_words) {
+        const auto value = word(key);
+        if (!value) {
+            return fail(fmt::format("c{} is not bound", key >> 32));
+        }
+        live_words.emplace(key, *value);
+    }
+    ::Common::unordered_map<u32, Shader::TextureType> live_types;
+    for (const auto& [handle, exact] : typed_handles) {
+        const auto key = std::ranges::find_if(handle_words, [&](u64 k) {
+            return cbuf_values.at(k) == handle;
+        });
+        if (key == handle_words.end()) {
+            return fail("texture handle without a word");
+        }
+        const u32 live = live_words.at(*key);
+        const auto pair{Tegra::Texture::TexturePair(live, qmd.linked_tsc != 0)};
+        const u32 index{Tegra::Texture::TextureHeaderIndex(pair.first, regs.tic.limit,
+                                                           gpu_memory.UsesNativeTiling())};
+        if (index > regs.tic.limit) {
+            return fail(fmt::format("texture handle {:#x} past the descriptor pool", live));
+        }
+        Tegra::Texture::TICEntry entry;
+        gpu_memory.ReadBlock(regs.tic.Address() + index * sizeof(entry), &entry, sizeof(entry));
+        const Shader::TextureType type{ConvertTextureType(entry)};
+        const bool same = exact ? type == texture_types.at(handle)
+                                : type != Shader::TextureType::Color2DRect &&
+                                      type != Shader::TextureType::Buffer;
+        if (!same) {
+            return fail(fmt::format("texture {:#x} has type {}", live, static_cast<u32>(type)));
+        }
+        live_types.emplace(handle, type);
+    }
+    // The dispatch's own values, as a recorded environment holds them.
+    ::Common::unordered_map<u32, Shader::TextureType> types;
+    for (const auto& [handle, type] : texture_types) {
+        if (!live_types.contains(handle)) {
+            types.emplace(handle, type);
+        }
+    }
+    for (const auto& [handle, type] : live_types) {
+        const auto key = *std::ranges::find_if(handle_words, [&](u64 k) {
+            return cbuf_values.at(k) == handle;
+        });
+        types.insert_or_assign(live_words.at(key), type);
+    }
+    texture_types = std::move(types);
+    for (const auto& [key, value] : live_words) {
+        cbuf_values.insert_or_assign(key, value);
+    }
+    static_context = false;
+    guess = nullptr;
+    rule_pointers.clear();
+    table_reads.clear();
+    handle_words.clear();
+    typed_handles.clear();
+    return true;
 }
 
 bool FileEnvironment::IsTexturePixelFormatInteger(u32 handle) {
@@ -1455,6 +1699,45 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
         LOG_ERROR(Common_Filesystem, "{}", e.what());
         // Cut off the part of the record that was written (a full disk), so that the next one
         // follows complete records.
+        file.exceptions(std::ios::goodbit);
+        file.close();
+        std::error_code error;
+        std::filesystem::resize_file(filename, static_cast<std::uintmax_t>(size), error);
+        if (error) {
+            LOG_ERROR(Common_Filesystem,
+                      "Failed to cut pipeline cache file {} back to {} bytes: {}",
+                      Common::FS::PathToUTF8String(filename), size, error.message());
+        }
+    }
+}
+
+void SerializePipeline(std::span<const char> key, const FileEnvironment& env,
+                       const std::filesystem::path& filename, u32 cache_version,
+                       u32 read_properties) {
+    const Common::FS::FileLock lock{PipelineCacheLockPath(filename), PipelineCacheLockWait};
+    if (lock.Busy()) {
+        return;
+    }
+    std::ofstream file(filename, std::ios::binary | std::ios::ate | std::ios::app);
+    const std::streamoff size{file.tellp()};
+    if (!file.is_open() || size < 0) {
+        LOG_ERROR(Common_Filesystem, "Failed to open pipeline cache file {}",
+                  Common::FS::PathToUTF8String(filename));
+        return;
+    }
+    try {
+        file.exceptions(std::ifstream::failbit);
+        if (size == 0) {
+            file.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+        }
+        const u32 num_envs{1};
+        file.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs));
+        env.Serialize(file, read_properties);
+        file.write(key.data(), key.size_bytes());
+        file.close();
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "{}", e.what());
         file.exceptions(std::ios::goodbit);
         file.close();
         std::error_code error;

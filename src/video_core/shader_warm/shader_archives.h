@@ -44,6 +44,9 @@ struct ShaderRecord {
     ProgramStage stage{};
     std::span<const u8> code;
     std::span<const u8> control;
+    /// The program's constant table (driver bank 1), empty when it has none: control word 60 is
+    /// its size and word 64 its offset from the start of the program allocation.
+    std::span<const u8> constants;
 };
 
 /// The game's Zstandard dictionaries (Pack/ZsDic.pack.zs), by dictionary ID.

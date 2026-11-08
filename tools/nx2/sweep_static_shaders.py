@@ -54,6 +54,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--spirv-val", default="spirv-val")
+    parser.add_argument("--static-context", action="store_true",
+                        help="without a cache match, derive driver context from the control section")
     args = parser.parse_args()
     if args.jobs < 1 or args.timeout < 1 or not args.compiler.is_file():
         parser.error("positive jobs/timeout and a compiler executable are required")
@@ -173,9 +175,15 @@ def main():
             base["selected_cache_context"] = {key: environment[key] for key in
                                               ("source", "entry", "index", "offset", "version")}
             base["cache_version"] = environment["version"]
+        elif base["stage"] == "compute" and args.static_context:
+            command += ["--control", base["control"], "--allocation", base["source"]]
+            base["context_source"] = "static-control-launch-with-static-driver-context"
         elif base["stage"] == "compute":
             return {**base, "status": "partial", "phase": "context", "lowered": True,
                     "error": {"message": "compute launch and resource context not established"}}
+        elif args.static_context:
+            command += ["--control", base["control"]]
+            base["context_source"] = "static-header-with-static-driver-context"
         else:
             base["context_source"] = "static-header-with-synthetic-pipeline-defaults"
         output = records / f"{identity}.spv"

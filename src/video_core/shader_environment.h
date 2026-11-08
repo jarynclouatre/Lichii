@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -243,6 +244,38 @@ public:
     void SetGuessMissing(const GuessMissing* guess_) noexcept {
         guess = guess_;
     }
+
+    /// Translation ahead of time from the game files (warm-up entries): reads without a record
+    /// are answered from rules (bank 0 16-byte slots are storage buffers, bank 1 is never a
+    /// pointer, texture handle words get placeholder handles, texture types come from the
+    /// program's instructions), then from the guess when one is set. The answers are recorded,
+    /// and the rule answers are what CheckDispatch compares with a dispatch.
+    void SetStaticContext() noexcept {
+        static_context = true;
+    }
+
+    /// Reads answered by the guess or by the assumed pixel format, plus texture types that
+    /// CheckDispatch could not compare: nonzero means the translation may differ from the one
+    /// the game's own state would give.
+    [[nodiscard]] size_t InexactReads() const;
+
+    /// Compares the answers SetStaticContext's rules gave, the constant table words read, the
+    /// local memory size and the texture bank with the compute dispatch about to run. When all
+    /// match, the translation is the one the dispatch would give: the dispatch's own handle
+    /// words and texture types replace the placeholders, so the environment can be cached like
+    /// a recorded one. Otherwise returns false with the first difference in `mismatch`.
+    [[nodiscard]] bool CheckDispatch(Tegra::Engines::KeplerCompute& kepler_compute,
+                                     Tegra::MemoryManager& gpu_memory, u32 texture_bank,
+                                     std::string& mismatch);
+
+    /// Writes the environment in the pipeline cache layout (see Deserialize).
+    void Serialize(std::ofstream& file, u32 read_properties) const;
+
+    [[nodiscard]] bool CanReadTextureDescriptors() const override {
+        return !static_context;
+    }
+
+    void NoteInferredTextureType(u32 handle, Shader::TextureType type) override;
     ~FileEnvironment() override = default;
 
     FileEnvironment& operator=(FileEnvironment&&) noexcept = default;
@@ -272,6 +305,8 @@ public:
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
+
+    [[nodiscard]] u32 ReadTextureHandleWord(u32 cbuf_index, u32 cbuf_offset) override;
 
     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override;
 
@@ -332,6 +367,16 @@ private:
     /// The EnvironmentReadProperties of the host that made the record, when its build wrote them
     std::optional<u32> recorded_read_properties;
     bool lacks_recorded_value{};
+    bool static_context{};
+    size_t inexact_reads{};
+    u64 code_size_bytes{};
+    // Static context: what CheckDispatch compares. Pointer answers from the rules, constant table
+    // words read, placeholder handle words, and handles whose type was answered (true: the exact
+    // type from the program's instructions, false: only "neither rect nor buffer" was used).
+    std::vector<u64> rule_pointers;
+    std::vector<u64> table_reads;
+    std::vector<u64> handle_words;
+    ::Common::unordered_map<u32, bool> typed_handles;
 };
 
 /// Where a pipeline is in a cache file, from its environment count to the end of its key, and a
@@ -345,6 +390,10 @@ struct PipelineRecord {
 
     bool operator==(const PipelineRecord&) const = default;
 };
+
+void SerializePipeline(std::span<const char> key, const FileEnvironment& env,
+                       const std::filesystem::path& filename, u32 cache_version,
+                       u32 read_properties);
 
 /// Appends a record with the host's Shader::HostTranslateInfo::EnvironmentReadProperties, holding
 /// the cache's lock (see PipelineCacheLockPath).

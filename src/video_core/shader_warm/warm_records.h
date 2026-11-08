@@ -82,11 +82,13 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control);
 
 /// One compute entry (env count, env, code, compute trailer, key); `key` gets the 24-byte key.
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
-                             ComputeKey& key);
+                             std::span<const u8> constants, ComputeKey& key);
 
 /// Env record of a single-stage graphics entry (stage 0 vertex or 4 fragment), without the
 /// leading env count and the key. `program` is the extracted allocation (header + code).
-std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program);
+/// `constants` is the program's constant table (ShaderRecord::constants), recorded as bank 1.
+std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program,
+                            std::span<const u8> constants);
 
 /// The key of a graphics entry: `template_key` with this stage's hash slot (vertex 1,
 /// fragment 5) and, for vertex, the attribute types.
