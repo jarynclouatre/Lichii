@@ -356,6 +356,20 @@ public:
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history);
 
+    /// Ocarina of Time DLSS mode (see the runtime's OotDlss). False when unsupported.
+    /// Copies an Ocarina of Time B10G11R11 image into the particle copy `which`
+    /// (OotMotionVectors::SnapshotScene), or with `restore` back. False if it is not there.
+    bool OotSnapshotScene(const Tegra::Engines::Fermi2D::Surface& surface, u32 which,
+                          bool restore = false);
+
+    bool OotDlss(const Tegra::Engines::Fermi2D::Surface& dst,
+                 const Tegra::Engines::Fermi2D::Surface& src,
+                 const Tegra::Texture::TICEntry& depth, std::array<f32, 2> jitter,
+                 const std::array<f32, 16>& reproject, bool flip_y, bool reset,
+                 bool hdr = false,
+                 const Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig* effects = nullptr,
+                 const Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig* fog = nullptr);
+
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(

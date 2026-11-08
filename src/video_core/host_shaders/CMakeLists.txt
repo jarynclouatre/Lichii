@@ -45,6 +45,8 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_s8d24_to_abgr8.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/full_screen_triangle.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/oot_motion_vectors.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/oot_particle_composite.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_convert_s8d24.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_copy_bc4.comp
@@ -101,13 +103,6 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_optical_flow.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/fsr3_frame_interpolation.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/dlss_network_probe.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_camera_motion.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.vert
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_actor_motion.frag
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_color.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_output.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_composite.comp
-    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_reference.comp
 )
 
 if (HAIKUOS)

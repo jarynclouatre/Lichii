@@ -113,6 +113,14 @@ void EmitIsbeWriteMapU32(EmitContext& ctx) {
     NotImplemented();
 }
 
+void EmitOotPrevCbufU32(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitOotShadowWriteAttribute(EmitContext& ctx) {
+    NotImplemented();
+}
+
 void EmitTensorMulAdd(EmitContext& ctx, IR::Inst& inst, const IR::Value& a,
                       const IR::Value& b, const IR::Value& c) {
     NotImplemented();

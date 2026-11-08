@@ -30,6 +30,7 @@
 #include "video_core/engines/native_upscale.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/oot_dlss.h"
 #include "video_core/memory_manager.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/oot_network.h"
@@ -1314,6 +1315,267 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
         LOG_INFO(HW_GPU, "DLSS contract handle+{:03x}={:08x}: tic={} addr={:#x} {}x{} raw={:08x}",
                  offset, handle, index, tic.Address(), tic.Width(), tic.Height(),
                  fmt::join(words, " "));
+    }
+}
+
+u64 KeplerCompute::HandleImageAddress(u32 offset) {
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < offset + 4 ||
+        !memory_manager.IsFullyMappedRange(address + offset, 4)) {
+        return 0;
+    }
+    const u32 index = memory_manager.Read<u32>(address + offset) & 0xfffff;
+    const GPUVAddr tic_address = regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry);
+    if (index > regs.tic.limit ||
+        !memory_manager.IsFullyMappedRange(tic_address, sizeof(Texture::TICEntry))) {
+        return 0;
+    }
+    return GetTICEntry(index).Address();
+}
+
+void KeplerCompute::ObserveOotNetwork(u64 program_id, u64 native_key) {
+    using namespace VideoCommon::OotDlss;
+    if (program_id != ProgramId || !ReplacesNetwork()) {
+        return;
+    }
+    // Native program keys and cb0 handle offsets from docs/nx2/oot-upscaler-network.md.
+    constexpr u64 NetworkKey = 0x42593194bb0b2b32ULL; // +0d0: R32 view of the scene colour
+    constexpr u64 OutputKey = 0xda6df3e54c716df2ULL;  // +0d0: the network's output
+    constexpr u64 DepthUserKey = 0xd897749a07b5f1c3ULL; // +030: the main scene depth
+    const auto learn = [&](std::atomic<u64>& target, u32 offset, const char* name) {
+        const u64 address = HandleImageAddress(offset);
+        if (address != 0 && target.exchange(address, std::memory_order_relaxed) != address) {
+            LOG_INFO(HW_GPU, "OoT DLSS: scene {} at {:#x}", name, address);
+        }
+    };
+    auto& targets = Targets();
+    switch (native_key) {
+    case NetworkKey:
+        learn(targets.color_gpu, 0xd0, "colour");
+        break;
+    case OutputKey:
+        learn(targets.output_gpu, 0xd0, "output");
+        break;
+    case DepthUserKey: {
+        learn(targets.depth_gpu, 0x30, "depth");
+        const auto& cbuf = launch_description.const_buffer_config[0];
+        const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+        if ((launch_description.const_buffer_enable_mask & 1) && cbuf.size.Value() >= 0x34 &&
+            memory_manager.IsFullyMappedRange(cbuf_address + 0x30, 4)) {
+            const u32 index = memory_manager.Read<u32>(cbuf_address + 0x30) & 0xfffff;
+            if (index <= regs.tic.limit) {
+                const Texture::TICEntry tic = GetTICEntry(index);
+                if (tic.format == Texture::TextureFormat::Z32 && tic.Address() != 0) {
+                    targets.depth_width.store(tic.Width(), std::memory_order_relaxed);
+                    targets.depth_height.store(tic.Height(), std::memory_order_relaxed);
+                    std::scoped_lock lock{targets.depth_mutex};
+                    targets.depth_tic = tic;
+                } else if (static bool logged = false; !std::exchange(logged, true)) {
+                    LOG_INFO(HW_GPU, "OoT DLSS: depth descriptor has format {:#x} at {:#x}",
+                             static_cast<u32>(tic.format.Value()), tic.Address());
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+bool KeplerCompute::ReplaceOotNetwork(u64 program_id, u64 native_key) {
+    using namespace VideoCommon::OotDlss;
+    if (program_id != ProgramId || !ReplacesNetwork()) {
+        return false;
+    }
+    constexpr u64 PrepassKey = 0x8475d671e6967428ULL;
+    constexpr u64 NetworkKey = 0x42593194bb0b2b32ULL;
+    constexpr u64 OutputKey = 0xda6df3e54c716df2ULL;
+    const u64 tonemapped = Targets().tonemapped_gpu.load(std::memory_order_relaxed);
+    if (native_key == PrepassKey || native_key == NetworkKey) {
+        return tonemapped != 0;
+    }
+    if (native_key != OutputKey || tonemapped == 0) {
+        return false;
+    }
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    if (!(launch_description.const_buffer_enable_mask & 1) || cbuf.size.Value() < 0xd4 ||
+        !memory_manager.IsFullyMappedRange(cbuf_address + 0xd0, 4)) {
+        return false;
+    }
+    const u32 index = memory_manager.Read<u32>(cbuf_address + 0xd0) & 0xfffff;
+    if (index > regs.tic.limit) {
+        return false;
+    }
+    const Texture::TICEntry output = GetTICEntry(index);
+    if (output.format != Texture::TextureFormat::B10G11R11 || output.Address() == 0 ||
+        output.Address() == tonemapped || !output.IsBlockLinear()) {
+        return false;
+    }
+    Fermi2D::Surface destination{};
+    destination.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    destination.linear = Fermi2D::MemoryLayout::BlockLinear;
+    destination.block_width.Assign(output.block_width);
+    destination.block_height.Assign(output.block_height);
+    destination.block_depth.Assign(output.block_depth);
+    destination.depth = 1;
+    destination.width = output.Width();
+    destination.height = output.Height();
+    destination.addr_upper = static_cast<u32>(output.Address() >> 32);
+    destination.addr_lower = static_cast<u32>(output.Address());
+    // The tonemapped image must be a B10G11R11 block-linear image of the output's size; it is
+    // read with its own block layout.
+    const auto& shape = Targets();
+    const u32 layout = shape.tonemapped_layout.load(std::memory_order_relaxed);
+    if (shape.tonemapped_width.load(std::memory_order_relaxed) != output.Width() ||
+        shape.tonemapped_height.load(std::memory_order_relaxed) != output.Height() ||
+        (layout & (3u << 12)) != 0) {
+        NoteFallback("tonemapped image unlike the output");
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            LOG_WARNING(HW_GPU, "OoT: tonemapped image {}x{} (layout {:#x}) unlike the output {}x{}",
+                        shape.tonemapped_width.load(std::memory_order_relaxed),
+                        shape.tonemapped_height.load(std::memory_order_relaxed), layout,
+                        output.Width(), output.Height());
+        }
+        return false;
+    }
+    Fermi2D::Surface source = destination;
+    source.block_width.Assign(layout & 0xf);
+    source.block_height.Assign((layout >> 4) & 0xf);
+    source.block_depth.Assign((layout >> 8) & 0xf);
+    source.addr_upper = static_cast<u32>(tonemapped >> 32);
+    source.addr_lower = static_cast<u32>(tonemapped);
+    const Fermi2D::Config config{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Point,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = static_cast<s32>(output.Width()),
+        .dst_y1 = static_cast<s32>(output.Height()),
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = static_cast<s32>(output.Width()),
+        .src_y1 = static_cast<s32>(output.Height()),
+    };
+    bool done = false;
+    std::optional<Texture::TICEntry> depth_tic;
+    {
+        std::scoped_lock lock{Targets().depth_mutex};
+        depth_tic = Targets().depth_tic;
+        Targets().output_tic = output;
+    }
+    // DLSS already ran on the HDR scene colour before the tonemap: copy the tonemapped image.
+    const bool hdr_done = Targets().hdr_frame.load(std::memory_order_relaxed) ==
+                          SceneFrame().load(std::memory_order_relaxed);
+    if (Requested() && !depth_tic && !hdr_done) {
+        NoteFallback("scene depth not seen yet");
+    }
+    if (Requested() && depth_tic && !hdr_done) {
+        Camera& camera = CurrentCamera();
+        std::array<float, 16> reproject{};
+        bool valid = false;
+        bool moving = false;
+        {
+            std::scoped_lock lock{camera.mutex};
+            valid = camera.valid;
+            moving = camera.moving;
+            reproject = camera.reproject;
+        }
+        const u64 scene_frame = SceneFrame().load(std::memory_order_relaxed);
+        if (valid) {
+            const bool flip_y = FlipY();
+            const bool reset = HistoryReset();
+            static u32 resets{}, calls{}, still{};
+            resets += reset ? 1 : 0;
+            still += moving ? 0 : 1;
+            if (++calls % 600 == 0) {
+                LOG_INFO(HW_GPU,
+                         "OoT DLSS: {} history resets in the last 600 frames, {} with an identical "
+                         "camera pair (no camera motion)",
+                         std::exchange(resets, 0), std::exchange(still, 0));
+            }
+            done = rasterizer->AccelerateOotDlss(source, destination, *depth_tic,
+                                                 ReportedJitter(scene_frame), reproject, flip_y, reset);
+        }
+        if (!valid) {
+            NoteFallback("camera not found");
+        }
+    }
+    if (!done) {
+        done = rasterizer->AccelerateSurfaceCopy(source, destination, config);
+    }
+    if (const u64 frame = SceneFrame().fetch_add(1, std::memory_order_relaxed) + 1;
+        Requested() && frame % 600 == 0) {
+        if (const std::string summary = TakeFallbackSummary(); !summary.empty()) {
+            LOG_INFO(HW_GPU, "OoT DLSS: fallbacks to a copy in the last 600 frames: {}", summary);
+        }
+    }
+    rasterizer->OotSceneEnd();
+    static bool logged = false;
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(HW_GPU, "OoT: game AA network replaced ({}): {:#x} -> {:#x} {}x{}",
+                 done ? "copy of the tonemapped image" : "copy failed", tonemapped,
+                 output.Address(), output.Width(), output.Height());
+    }
+    return done;
+}
+
+void KeplerCompute::TraceComputeHandles(u64 native_key, u64 shader_hash) {
+    static const bool enabled = std::getenv("EDEN_NX2_COMPUTE_HANDLE_TRACE") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static std::unordered_map<u64, u32> seen;
+    const u32 count = ++seen[native_key];
+    if (count != 1 && count != 61 && count != 62) {
+        return;
+    }
+    const auto& cbuf = launch_description.const_buffer_config[0];
+    const GPUVAddr address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
+    const u32 bytes = (launch_description.const_buffer_enable_mask & 1)
+                          ? std::min<u32>(cbuf.size.Value(), 0x400U)
+                          : 0;
+    LOG_INFO(HW_GPU,
+             "Compute trace key={:016x} shader={:016x} #{} program={:#x} grid={}x{}x{} "
+             "block={}x{}x{} cb0={:#x} size={:#x}",
+             native_key, shader_hash, count, regs.code_loc.Address() + launch_description.program_start,
+             launch_description.grid_dim_x.Value(), launch_description.grid_dim_y.Value(),
+             launch_description.grid_dim_z.Value(), launch_description.block_dim_x.Value(),
+             launch_description.block_dim_y.Value(), launch_description.block_dim_z.Value(),
+             address, cbuf.size.Value());
+    if (bytes < 16 || !memory_manager.IsFullyMappedRange(address, bytes)) {
+        return;
+    }
+    std::vector<u32> words(bytes / 4);
+    memory_manager.ReadBlock(address, words.data(), words.size() * 4);
+    for (size_t i = 0; i + 4 <= words.size(); i += 4) {
+        if (words[i] | words[i + 1] | words[i + 2] | words[i + 3]) {
+            LOG_INFO(HW_GPU, "  key={:016x} cb0+{:03x}: {:08x} {:08x} {:08x} {:08x}", native_key,
+                     i * 4, words[i], words[i + 1], words[i + 2], words[i + 3]);
+        }
+    }
+    for (size_t i = 0; i < words.size(); ++i) {
+        const u32 index = words[i] & 0xfffff;
+        const GPUVAddr tic_address = regs.tic.Address() + u64{index} * sizeof(Texture::TICEntry);
+        if (words[i] == 0 || index > regs.tic.limit ||
+            !memory_manager.IsFullyMappedRange(tic_address, sizeof(Texture::TICEntry))) {
+            continue;
+        }
+        const auto tic = GetTICEntry(index);
+        if (tic.Address() == 0 || tic.Width() < 8 || tic.Height() < 1 || tic.Width() > 16384 ||
+            tic.Height() > 16384) {
+            continue;
+        }
+        LOG_INFO(HW_GPU, "  key={:016x} handle cb0+{:03x}={:08x}: tic {} {}x{}x{} format {:#x} "
+                 "types {}/{}/{}/{} srgb={} addr={:#x}",
+                 native_key, i * 4, words[i], index, tic.Width(), tic.Height(), tic.Depth(),
+                 static_cast<u32>(tic.format.Value()), static_cast<u32>(tic.r_type.Value()),
+                 static_cast<u32>(tic.g_type.Value()), static_cast<u32>(tic.b_type.Value()),
+                 static_cast<u32>(tic.a_type.Value()), tic.srgb_conversion != 0, tic.Address());
     }
 }
 

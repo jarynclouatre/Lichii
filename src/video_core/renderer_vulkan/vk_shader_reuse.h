@@ -82,8 +82,10 @@ struct ShaderTranslationKey {
     bool xfb_requested;
     bool library_link_mode;
     bool graphics_no_inline;
+    bool oot_motion;
+    u8 oot_mesh_motion;
     /// Always zero: makes the padding explicit, so the key can be compared and hashed as bytes.
-    std::array<u8, 7> zero_padding;
+    std::array<u8, 5> zero_padding;
 
     bool operator==(const ShaderTranslationKey& rhs) const noexcept;
 };

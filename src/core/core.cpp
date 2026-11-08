@@ -74,6 +74,7 @@
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#include "video_core/oot_dlss.h"
 #include "video_core/video_core.h"
 
 namespace Core {
@@ -462,6 +463,19 @@ struct System::Impl {
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
+
+        // Ocarina of Time with NVIDIA DLSS outputs 4K: the game's 2560x1440 at 1.5x (only the
+        // output side when DLSS upscales from 1440p, see video_core/oot_dlss.h). Per-game value,
+        // so the saved configuration is untouched; EDEN_RES_SETUP still wins.
+        if (params.program_id == VideoCommon::OotDlss::ProgramId &&
+            VideoCommon::OotDlss::Requested() && std::getenv("EDEN_RES_SETUP") == nullptr) {
+            LOG_INFO(Core, "Ocarina of Time DLSS: 4K output ({}), resolution scale 1.5x",
+                     VideoCommon::OotDlss::Output() == Settings::OotDlssOutput::Dlaa4k
+                         ? "DLAA"
+                         : "Quality from 2560x1440");
+            Settings::values.resolution_setup.SetGlobal(false);
+            Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res3_2X);
+        }
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);

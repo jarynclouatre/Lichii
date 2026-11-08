@@ -11,11 +11,14 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
-#include <vector>
+#include <mutex>
+#include <set>
+#include <string>
+#include <string_view>
 #include <tuple>
+#include <vector>
 #include <optional>
 #include <bit>
-#include <string>
 #include <utility>
 #include "common/container/unordered_map.h"
 #include <boost/container/small_vector.hpp>
@@ -30,6 +33,8 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/oot_dlss.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
@@ -40,6 +45,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/vulkan_common/unbacked_image_policy.h"
 
 namespace VideoCommon {
 
@@ -47,6 +53,36 @@ namespace VideoCommon {
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
     return enabled;
+}
+
+/// EDEN_NX2_RESCALE_TRACE=1: log once per image and reason why an image stays at 1x, and each
+/// image that a written storage binding scales down (with resolution scaling on).
+inline bool RescaleTraceEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_RESCALE_TRACE") != nullptr;
+    return enabled;
+}
+
+/// Images wider or taller than this at 1x are not screen images and stay at 1x.
+inline constexpr u32 MaxScreenImageSide = 4096;
+
+inline void TraceRescale(const ImageBase& image, std::string_view reason,
+                         const ImageBase* other = nullptr) {
+    static std::mutex mutex;
+    static std::set<std::tuple<GPUVAddr, u32, u32, std::string>> seen;
+    std::scoped_lock lock{mutex};
+    if (seen.size() > 4096 ||
+        !seen.emplace(image.gpu_addr, image.info.size.width, static_cast<u32>(image.info.format),
+                      std::string(reason))
+             .second) {
+        return;
+    }
+    const std::string with =
+        other != nullptr ? fmt::format(" {:#x} {} {}x{}", other->gpu_addr, other->info.format,
+                                       other->info.size.width, other->info.size.height)
+                         : std::string{};
+    LOG_INFO(HW_GPU, "Rescale: {:#x} {} {}x{} levels {} layers {}: {}{}", image.gpu_addr,
+             image.info.format, image.info.size.width, image.info.size.height,
+             image.info.resources.levels, image.info.resources.layers, reason, with);
 }
 
 using Tegra::Texture::TICEntry;
@@ -648,6 +684,10 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                         continue;
                     }
                     auto& image = slot_images[image_view.image_id];
+                    if (RescaleTraceEnabled() && True(image.flags & ImageFlagBits::Rescaled)) {
+                        TraceRescale(image, compute ? "written by compute"
+                                                    : "written storage image");
+                    }
                     has_blacklisted |= ScaleDown(image);
                     image.scale_rating = 0;
                 }
@@ -995,6 +1035,27 @@ bool TextureCache<P>::RescaleRenderTargets() {
             }
         } else {
             rescaled = false;
+            if (RescaleTraceEnabled()) {
+                const auto blocker = [&](ImageId id) -> ImageBase* {
+                    return id != CORRUPT_ID && !ImageCanRescale(slot_images[id]) ? &slot_images[id]
+                                                                                  : nullptr;
+                };
+                ImageBase* blocked = blocker(tmp_depth_image);
+                for (size_t index = 0; index < NUM_RT && blocked == nullptr; ++index) {
+                    blocked = blocker(tmp_color_images[index]);
+                }
+                for (const ImageId id : tmp_color_images) {
+                    if (id != CORRUPT_ID && blocked != nullptr && &slot_images[id] != blocked &&
+                        True(slot_images[id].flags & ImageFlagBits::Rescaled)) {
+                        TraceRescale(slot_images[id], "render target bound with", blocked);
+                    }
+                }
+                if (tmp_depth_image != CORRUPT_ID && blocked != nullptr &&
+                    &slot_images[tmp_depth_image] != blocked &&
+                    True(slot_images[tmp_depth_image].flags & ImageFlagBits::Rescaled)) {
+                    TraceRescale(slot_images[tmp_depth_image], "depth bound with", blocked);
+                }
+            }
             const auto scale_down = [this](ImageId image_id) {
                 if (image_id != CORRUPT_ID) {
                     Image& image = slot_images[image_id];
@@ -1635,6 +1696,189 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             slot_image_views[motion_view->second],
             depth_view ? &slot_image_views[depth_view] : nullptr, render_size, jitter,
             motion_scale, use_history);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::OotDlss(const Tegra::Engines::Fermi2D::Surface& dst,
+                              const Tegra::Engines::Fermi2D::Surface& src,
+                              const Tegra::Texture::TICEntry& depth, std::array<f32, 2> jitter,
+                              const std::array<f32, 16>& reproject, bool flip_y, bool reset,
+                              bool hdr,
+                              const Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig* effects,
+                              const Tegra::Engines::Maxwell3D::Regs::RenderTargetConfig* fog) {
+    if constexpr (FRAMEBUFFER_BLITS ||
+                  !requires(Runtime& r, Framebuffer* f, ImageView& v) {
+                      r.OotDlss(f, v, v, std::array<u32, 2>{}, jitter, reproject, flip_y, reset);
+                  }) {
+        return false;
+    } else {
+        const Tegra::Engines::Fermi2D::Config copy{
+            .operation = Tegra::Engines::Fermi2D::Operation::SrcCopy,
+            .filter = Tegra::Engines::Fermi2D::Filter::Point,
+            .must_accelerate = true,
+            .dst_x0 = 0,
+            .dst_y0 = 0,
+            .dst_x1 = static_cast<s32>(dst.width),
+            .dst_y1 = static_cast<s32>(dst.height),
+            .src_x0 = 0,
+            .src_y0 = 0,
+            .src_x1 = static_cast<s32>(src.width),
+            .src_y1 = static_cast<s32>(src.height),
+        };
+        const auto result = GetBlitImages(dst, src, copy);
+        if (!result) {
+            VideoCommon::OotDlss::NoteFallback("colour or output image not found");
+            return false;
+        }
+        has_deleted_images = false;
+        const ImageId depth_id =
+            FindOrInsertImage(ImageInfo(depth), depth.Address(), RelaxedOptions{});
+        if (has_deleted_images || !depth_id) {
+            VideoCommon::OotDlss::NoteFallback("scene depth image not found");
+            return false;
+        }
+        // The effects layer, for DLSS's bias-to-current-colour mask (optional).
+        ImageId effects_id{};
+        if (effects != nullptr && VideoCommon::OotDlss::MaskGain() > 0.0f) {
+            effects_id =
+                FindOrInsertImage(ImageInfo(*effects, Tegra::Texture::MsaaMode::Msaa1x1),
+                                  effects->Address(), RelaxedOptions{});
+            if (has_deleted_images) {
+                return false;
+            }
+            if (effects_id) {
+                PrepareImage(effects_id, false, false);
+            }
+        }
+        ImageId fog_id{};
+        if (fog != nullptr && VideoCommon::OotDlss::FogMaskGain() > 0.0f) {
+            fog_id = FindOrInsertImage(ImageInfo(*fog, Tegra::Texture::MsaaMode::Msaa1x1),
+                                       fog->Address(), RelaxedOptions{});
+            if (has_deleted_images) {
+                return false;
+            }
+            if (fog_id) {
+                PrepareImage(fog_id, false, false);
+            }
+        }
+        const ImageId dst_id = result->dst_id;
+        const ImageId src_id = result->src_id;
+        PrepareImage(src_id, false, false);
+        PrepareImage(depth_id, false, false);
+        PrepareImage(dst_id, true, false);
+        if (slot_images[depth_id].info.format != PixelFormat::D32_FLOAT ||
+            slot_images[depth_id].info.num_samples != 1 ||
+            slot_images[src_id].info.num_samples != 1 ||
+            slot_images[dst_id].info.num_samples != 1) {
+            VideoCommon::OotDlss::NoteFallback("unexpected depth format or multisampling");
+            return false;
+        }
+        const auto rescaled = [&](ImageId id) {
+            return True(slot_images[id].flags & ImageFlagBits::Rescaled);
+        };
+        // DLSS reads colour and depth texel for texel: same scale (the output may differ).
+        if (rescaled(src_id) != rescaled(depth_id)) {
+            VideoCommon::OotDlss::NoteFallback("colour and depth at different scales");
+            return false;
+        }
+        const Extent3D src_size = slot_images[src_id].info.size;
+        const Extent3D depth_size = slot_images[depth_id].info.size;
+        if (src_size.width != depth_size.width || src_size.height != depth_size.height) {
+            VideoCommon::OotDlss::NoteFallback("colour and depth of different sizes");
+            return false;
+        }
+        const std::array<u32, 2> render_size =
+            rescaled(src_id)
+                ? std::array{Settings::values.resolution_info.ScaleUp(src_size.width),
+                             Settings::values.resolution_info.ScaleUp(src_size.height)}
+                : std::array{src_size.width, src_size.height};
+        const auto view = [&](ImageId id, const Tegra::Engines::Fermi2D::Surface& surface,
+                              PixelFormat format)
+            -> std::optional<std::pair<FramebufferId, ImageViewId>> {
+            const std::optional base = slot_images[id].TryFindBase(surface.Address());
+            if (!base) {
+                return std::nullopt;
+            }
+            const SubresourceRange range{.base = *base, .extent = {1, 1}};
+            return RenderTargetFromImage(id, ImageViewInfo(ImageViewType::e2D, format, range));
+        };
+        const auto src_view = view(src_id, src, result->src_format);
+        const auto dst_view = view(dst_id, dst, result->dst_format);
+        if (!src_view || !dst_view) {
+            VideoCommon::OotDlss::NoteFallback("no view of the colour or output");
+            return false;
+        }
+        ImageViewId depth_view{};
+        if (const std::optional base = slot_images[depth_id].TryFindBase(depth.Address())) {
+            const SubresourceRange range{.base = *base, .extent = {1, 1}};
+            depth_view = FindOrEmplaceImageView(
+                depth_id, ImageViewInfo(ImageViewType::e2D, PixelFormat::D32_FLOAT, range));
+        }
+        if (!depth_view) {
+            VideoCommon::OotDlss::NoteFallback("no view of the scene depth");
+            return false;
+        }
+        ImageViewId effects_view{};
+        if (effects_id && slot_images[effects_id].info.format == PixelFormat::R16G16B16A16_FLOAT) {
+            if (const std::optional base =
+                    slot_images[effects_id].TryFindBase(effects->Address())) {
+                const SubresourceRange range{.base = *base, .extent = {1, 1}};
+                effects_view = FindOrEmplaceImageView(
+                    effects_id,
+                    ImageViewInfo(ImageViewType::e2D, PixelFormat::R16G16B16A16_FLOAT, range));
+            }
+        }
+        ImageViewId fog_view{};
+        if (fog_id && slot_images[fog_id].info.format == PixelFormat::R16G16B16A16_FLOAT) {
+            if (const std::optional base = slot_images[fog_id].TryFindBase(fog->Address())) {
+                const SubresourceRange range{.base = *base, .extent = {1, 1}};
+                fog_view = FindOrEmplaceImageView(
+                    fog_id,
+                    ImageViewInfo(ImageViewType::e2D, PixelFormat::R16G16B16A16_FLOAT, range));
+            }
+        }
+        Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_view->first];
+        if (!runtime.OotDlss(dst_framebuffer, slot_image_views[src_view->second],
+                             slot_image_views[depth_view], render_size, jitter, reproject, flip_y,
+                             reset, hdr,
+                             effects_view ? &slot_image_views[effects_view] : nullptr,
+                             fog_view ? &slot_image_views[fog_view] : nullptr)) {
+            VideoCommon::OotDlss::NoteFallback("DLSS evaluation unavailable");
+            return false;
+        }
+        return true;
+    }
+}
+
+template <class P>
+bool TextureCache<P>::OotSnapshotScene(const Tegra::Engines::Fermi2D::Surface& scene, u32 which,
+                                       bool restore) {
+    if constexpr (!requires(Runtime& r, Image& i) {
+                      r.OotSnapshotScene(i.Handle(), i.info.format, std::array<u32, 2>{}, which,
+                                         restore);
+                  }) {
+        return false;
+    } else {
+        has_deleted_images = false;
+        const ImageId id = FindImage(ImageInfo(scene), scene.Address(), RelaxedOptions{});
+        if (has_deleted_images || !id) {
+            return false;
+        }
+        Image& image = slot_images[id];
+        if (image.gpu_addr != scene.Address() || image.info.num_samples != 1 ||
+            image.info.format != PixelFormat::B10G11R11_FLOAT) {
+            return false;
+        }
+        PrepareImage(id, restore, false);
+        const bool rescaled = True(image.flags & ImageFlagBits::Rescaled);
+        const std::array<u32, 2> extent{
+            rescaled ? Settings::values.resolution_info.ScaleUp(image.info.size.width)
+                     : image.info.size.width,
+            rescaled ? Settings::values.resolution_info.ScaleUp(image.info.size.height)
+                     : image.info.size.height};
+        runtime.OotSnapshotScene(image.Handle(), image.info.format, extent, which, restore);
+        return true;
     }
 }
 
@@ -2504,6 +2748,15 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
 template <class P>
 bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
+        if (RescaleTraceEnabled()) {
+            TraceRescale(image, "not rescaleable");
+        }
+        return false;
+    }
+    if (OotDlss::OutputOnlyRescale() && !OotDlss::IsOutputImage(image.gpu_addr, image.info.format,
+                                                               image.info.size.width)) {
+        // Ocarina of Time DLSS Quality: the 3D stays at 2560x1440, DLSS upscales into the
+        // rescaled output.
         return false;
     }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
@@ -2520,6 +2773,32 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
         if (HostMipLevelCount(width, height, info.size.depth, levels) < levels)
             return false;
     }
+    if (image.info.size.width > MaxScreenImageSide || image.info.size.height > MaxScreenImageSide) {
+        // Larger than any screen the console outputs (3840x2160): a shadow map or an atlas, which
+        // scaling only makes bigger (Ocarina of Time's 12288x12288 sun shadow map: ~650 MiB at
+        // 1.5x).
+        if (RescaleTraceEnabled()) {
+            TraceRescale(image, "larger than any screen");
+        }
+        return false;
+    }
+    {
+        // Keep an image at 1x when the Vulkan allocator would leave its scaled copy unbacked
+        // (an unbacked image drops writes and samples as zero), by the allocator's own rule:
+        // past 2^28 texels and more than a quarter of the device-local memory. Ocarina of
+        // Time's 33-layer 2560x1440 scene depth (274M texels at 1.5x, 1.1 GiB) is backed.
+        const auto& res = Settings::values.resolution_info;
+        const u64 scaled_texels = u64{res.ScaleUp(image.info.size.width)} *
+                                  res.ScaleUp(image.info.size.height) *
+                                  (std::max)(image.info.resources.layers, 1);
+        if (Vulkan::ShouldLeaveImageUnbacked(scaled_texels, GetScaledImageSizeBytes(image),
+                                             runtime.GetDeviceLocalMemory())) {
+            if (RescaleTraceEnabled()) {
+                TraceRescale(image, "scaled copy would be unbacked");
+            }
+            return false;
+        }
+    }
     if (True(image.flags & (ImageFlagBits::Rescaled | ImageFlagBits::CheckingRescalable))) {
         return true;
     }
@@ -2530,6 +2809,9 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     for (const auto& alias : image.aliased_images) {
         Image& other_image = slot_images[alias.id];
         if (!ImageCanRescale(other_image)) {
+            if (RescaleTraceEnabled()) {
+                TraceRescale(image, "alias stays 1x", &other_image);
+            }
             image.flags &= ~ImageFlagBits::CheckingRescalable;
             return false;
         }

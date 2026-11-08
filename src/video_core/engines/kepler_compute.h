@@ -258,6 +258,18 @@ public:
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
+    /// EDEN_NX2_COMPUTE_HANDLE_TRACE=1: logs a compute program's launch and the texture handles
+    /// in its constant buffer 0, at its 1st, 61st and 62nd dispatch.
+    void TraceComputeHandles(u64 native_key, u64 shader_hash);
+    /// Ocarina of Time DLSS mode: learn the scene depth, colour and output images from the
+    /// network's own texture handles (they keep their offsets while their indices rotate).
+    void ObserveOotNetwork(u64 program_id, u64 native_key);
+    /// Ocarina of Time DLSS / no-sharpen modes: true when this network dispatch is replaced (the
+    /// output pass is replaced by DLSS or a copy of the tonemapped image).
+    bool ReplaceOotNetwork(u64 program_id, u64 native_key);
+    /// GPU address of the image a cb0 texture handle at `offset` points to, or 0.
+    u64 HandleImageAddress(u32 offset);
+
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro

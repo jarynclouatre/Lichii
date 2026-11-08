@@ -169,6 +169,34 @@ TEST_CASE("Shader reuse cache finds shaders by key and environment", "[shader_re
     REQUIRE(cache.Find(key, too_many) == nullptr);
 }
 
+TEST_CASE("Shader reuse separates object motion and mesh shadow variants", "[shader_reuse]") {
+    TestEnvironment env;
+    auto shaders = std::make_shared<Vulkan::ReusableShaders>();
+    shaders->reads.push_back(Translate(env));
+    Vulkan::ShaderTranslationKey key{};
+    key.unique_hashes[1] = 0x1234;
+    key.unique_hashes[5] = 0x5678;
+    Vulkan::ShaderReuseCache cache;
+    cache.Add(key, shaders);
+    std::array<Shader::Environment*, 1> envs{&env};
+
+    auto motion_key = key;
+    motion_key.oot_motion = true;
+    REQUIRE(cache.Find(motion_key, envs) == nullptr);
+    cache.Add(motion_key, shaders);
+    REQUIRE(cache.Find(motion_key, envs) == shaders);
+
+    auto shadow_key = motion_key;
+    shadow_key.oot_mesh_motion = 's';
+    REQUIRE(cache.Find(shadow_key, envs) == nullptr);
+    cache.Add(shadow_key, shaders);
+    auto history_key = shadow_key;
+    history_key.oot_mesh_motion = 'h';
+    REQUIRE(cache.Find(history_key, envs) == nullptr);
+    REQUIRE(cache.Find(shadow_key, envs) == shaders);
+    REQUIRE(cache.Find(key, envs) == shaders);
+}
+
 TEST_CASE("Shader recorder preserves descriptor inference and source size", "[shader_reuse]") {
     TestEnvironment env;
     env.descriptors = false;

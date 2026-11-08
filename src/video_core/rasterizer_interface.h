@@ -249,6 +249,21 @@ public:
         return false;
     }
 
+    /// Ocarina of Time: the frame's 3D is done (the network output pass ran).
+    virtual void OotSceneEnd() {}
+
+    /// Ocarina of Time DLSS mode: NVIDIA DLSS of `src` (tonemapped colour) into `dst` with
+    /// motion vectors rebuilt from `depth` and `reproject` (previous clip from current NDC,
+    /// row-major) and this frame's viewport jitter (render pixels). False when unavailable.
+    [[nodiscard]] virtual bool AccelerateOotDlss(const Tegra::Engines::Fermi2D::Surface& src,
+                                                 const Tegra::Engines::Fermi2D::Surface& dst,
+                                                 const Tegra::Texture::TICEntry& depth,
+                                                 std::array<f32, 2> jitter,
+                                                 const std::array<f32, 16>& reproject,
+                                                 bool flip_y, bool reset) {
+        return false;
+    }
+
     /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
     [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {

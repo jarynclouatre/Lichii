@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -48,11 +49,6 @@
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
-#include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
-#ifdef EGLANTINE_STREAMLINE
-#include "video_core/renderer_vulkan/vk_streamline_dlss.h"
-#include "video_core/vulkan_common/streamline.h"
-#endif
 #include "video_core/renderer_vulkan/submission_policy.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -60,6 +56,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_oot_object_motion.h"
+#include "video_core/oot_dlss.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -792,6 +790,175 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         ++fast_draw_stats.verified;
         fast_draw_stats.pipeline_mismatches += verify_pipeline != pipeline ? 1 : 0;
     }
+    if (VideoCommon::OotDlss::Requested() &&
+        Settings::GetCurrentProgramID() == VideoCommon::OotDlss::ProgramId) [[unlikely]] {
+        CaptureOotCamera();
+    }
+    if (pipeline && VideoCommon::OotDlss::ObjectMotionRequested() &&
+        Settings::GetCurrentProgramID() == VideoCommon::OotDlss::ProgramId &&
+        maxwell3d->regs.zeta_enable && !pipeline->UsesOotMotion()) [[unlikely]] {
+        // A scene draw that falls back to camera motion: named once, with the reason.
+        const u64 depth = VideoCommon::OotDlss::Targets().depth_gpu.load(std::memory_order_relaxed);
+        if (depth != 0 && maxwell3d->regs.zeta.Address() == depth &&
+            oot_reject_seen.insert(pipeline).second) {
+            const auto& hashes = pipeline->ShaderHashes();
+            u64 geometry = 0;
+            for (size_t index = 1; index + 1 < hashes.size() && geometry == 0; ++index) {
+                geometry = hashes[index];
+            }
+            if (const char* reason = VideoCommon::OotDlss::FirstSceneReject(geometry, hashes[5])) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+                    LOG_INFO(Render_Vulkan,
+                             "OoT DLSS: scene draws without object motion: geometry {:016x} "
+                             "fs {:016x} ({})",
+                             geometry, hashes[5], reason);
+                }
+            }
+        }
+    }
+    if (pipeline && VideoCommon::OotDlss::ReplacesNetwork() &&
+        Settings::GetCurrentProgramID() == VideoCommon::OotDlss::ProgramId) [[unlikely]] {
+        // A tonemap pass: a known fragment shader, or the tonemap vertex shader drawing a
+        // B10G11R11 target of the scene's size.
+        const auto& targets = VideoCommon::OotDlss::Targets();
+        const auto& rt0 = maxwell3d->regs.rt[0];
+        if (oot_post_fog_recording &&
+            rt0.Address() == targets.color_gpu.load(std::memory_order_relaxed)) {
+            // After the fog composite the game draws more opaque scene (the water surface) and
+            // the particles, transparent and not writing depth. DLSS (or the copy for it) runs at
+            // the first draw that does not write depth: the opaque draws before it stay in its
+            // input, jittered and anti-aliased; the particles after it never enter its history.
+            const auto& regs = maxwell3d->regs;
+            const auto dst = regs.blend_per_target_enabled != 0
+                                 ? regs.blend_per_target[0].color_dest
+                                 : regs.blend.color_dest;
+            using Factor = Tegra::Engines::Maxwell3D::Regs::Blend::Factor;
+            const bool writes_depth = regs.depth_test_enable && regs.depth_write_enabled;
+            const bool trigger =
+                !writes_depth && oot_dlss_after_fog_frame ==
+                                     VideoCommon::OotDlss::SceneFrame().load(std::memory_order_relaxed);
+            if (oot_post_fog_order.size() < 400) {
+                oot_post_fog_order += trigger ? "|" : "";
+                oot_post_fog_order += writes_depth             ? 'O'
+                                      : regs.blend.enable[0] == 0 ? 'o'
+                                      : dst == Factor::One_D3D || dst == Factor::One_GL ? 'a'
+                                                                                        : 'b';
+            }
+            if (trigger) {
+                oot_dlss_after_fog_frame = ~0ULL;
+                if (VideoCommon::OotDlss::HdrInput()) {
+                    OotDlssBeforeTonemap();
+                } else {
+                    OotSnapshotScene(0);
+                }
+            }
+        }
+        if (VideoCommon::OotDlss::Requested() &&
+            VideoCommon::OotDlss::HdrDlssStage() != VideoCommon::OotDlss::HdrStage::Tonemap &&
+            rt0.Address() == targets.color_gpu.load(std::memory_order_relaxed)) {
+            for (const u64 hash : pipeline->ShaderHashes()) {
+                if (!VideoCommon::OotDlss::IsFogCompositeShader(hash)) {
+                    continue;
+                }
+                if (VideoCommon::OotDlss::HdrInput() &&
+                    VideoCommon::OotDlss::HdrDlssStage() == VideoCommon::OotDlss::HdrStage::Fog) {
+                    OotDlssBeforeTonemap();
+                } else {
+                    oot_dlss_after_fog_frame =
+                        VideoCommon::OotDlss::SceneFrame().load(std::memory_order_relaxed);
+                }
+                oot_post_fog_order.clear();
+                oot_post_fog_recording = true;
+                break;
+            }
+        }
+        // The effects layer: one RGBA16F target at half the scene's size (the volumetric fog
+        // draws two at once).
+        if (VideoCommon::OotDlss::Requested() && VideoCommon::OotDlss::MaskGain() > 0.0f &&
+            maxwell3d->regs.rt_control.count == 1 &&
+            rt0.format == Tegra::RenderTargetFormat::R16G16B16A16_FLOAT &&
+            rt0.width * 2 == targets.depth_width.load(std::memory_order_relaxed) &&
+            rt0.height * 2 == targets.depth_height.load(std::memory_order_relaxed)) {
+            if (static u32 logged{}; (!oot_effects_rt || oot_effects_rt->Address() != rt0.Address()) &&
+                                     logged++ < 4) {
+                LOG_INFO(Render_Vulkan, "OoT DLSS: effects layer at {:#x} {}x{}", rt0.Address(),
+                         u32{rt0.width}, u32{rt0.height});
+            }
+            oot_effects_rt = rt0;
+        }
+        // The volumetric fog: the second of two RGBA16F targets at half the scene's size.
+        const auto& rt1 = maxwell3d->regs.rt[1];
+        if (VideoCommon::OotDlss::Requested() && VideoCommon::OotDlss::FogMaskGain() > 0.0f &&
+            maxwell3d->regs.rt_control.count == 2 &&
+            rt1.format == Tegra::RenderTargetFormat::R16G16B16A16_FLOAT &&
+            rt1.width * 2 == targets.depth_width.load(std::memory_order_relaxed) &&
+            rt1.height * 2 == targets.depth_height.load(std::memory_order_relaxed)) {
+            if (static u32 logged{}; (!oot_fog_rt || oot_fog_rt->Address() != rt1.Address()) &&
+                                     logged++ < 4) {
+                LOG_INFO(Render_Vulkan, "OoT DLSS: fog layer at {:#x}", rt1.Address());
+            }
+            oot_fog_rt = rt1;
+        }
+        const bool tonemap_target =
+            rt0.format == Tegra::RenderTargetFormat::B10G11R11_FLOAT &&
+            rt0.width == targets.depth_width.load(std::memory_order_relaxed) &&
+            rt0.height == targets.depth_height.load(std::memory_order_relaxed);
+        for (const u64 hash : pipeline->ShaderHashes()) {
+            if (VideoCommon::OotDlss::IsTonemapShader(hash) ||
+                (tonemap_target && VideoCommon::OotDlss::IsTonemapVertexShader(hash))) {
+                const u64 target = maxwell3d->regs.rt[0].Address();
+                auto& tonemapped = VideoCommon::OotDlss::Targets().tonemapped_gpu;
+                if (target != 0 && tonemapped.exchange(target, std::memory_order_relaxed) != target) {
+                    if (static u32 logged{}; logged++ < 8) {
+                        LOG_INFO(Render_Vulkan, "OoT DLSS: tonemapped scene at {:#x}", target);
+                    }
+                }
+                // The scene-colour draws after the fog composite, once a while: O opaque
+                // (writes depth), o opaque, b blended, a additive; | where DLSS ran.
+                if (std::exchange(oot_post_fog_recording, false)) {
+                    static u32 frames{}, logged{};
+                    if (frames++ % 600 == 0 && logged++ < 8) {
+                        LOG_INFO(Render_Vulkan, "OoT DLSS: after the fog composite: {}",
+                                 oot_post_fog_order);
+                    }
+                }
+                // Its own shape: the copy and DLSS read it with this, not the output's.
+                auto& shape = VideoCommon::OotDlss::Targets();
+                shape.tonemapped_width.store(rt0.width, std::memory_order_relaxed);
+                shape.tonemapped_height.store(rt0.height, std::memory_order_relaxed);
+                shape.tonemapped_layout.store(
+                    u32{rt0.tile_mode.block_width} | (u32{rt0.tile_mode.block_height} << 4) |
+                        (u32{rt0.tile_mode.block_depth} << 8) |
+                        (rt0.tile_mode.is_pitch_linear ? 1u << 12 : 0u) |
+                        (rt0.format == Tegra::RenderTargetFormat::B10G11R11_FLOAT ? 0u : 1u << 13),
+                    std::memory_order_relaxed);
+                if (const auto& cb3 = maxwell3d->state.shader_stages[4].const_buffers[3];
+                    cb3.enabled && cb3.size >= 80) {
+                    // c[3]: a colour matrix, then (?, exposure, ?, ?) and the curve's peak,
+                    // contrast, shoulder and toe. Logged as it changes.
+                    std::array<f32, 8> curve{};
+                    gpu_memory->ReadBlockUnsafe(cb3.address + 48, curve.data(), sizeof(curve));
+                    if (curve[1] > 0.0f && std::isfinite(curve[1]) &&
+                        shape.exposure.exchange(curve[1], std::memory_order_relaxed) !=
+                            curve[1]) {
+                        if (static u32 logged{}; logged++ < 32) {
+                            LOG_INFO(Render_Vulkan, "OoT DLSS: tonemap exposure {} (c[3] 48: {})",
+                                     curve[1], fmt::join(curve, " "));
+                        }
+                    }
+                }
+                if (VideoCommon::OotDlss::HdrInput()) {
+                    OotDlssBeforeTonemap();
+                } else if (!oot_redrawing &&
+                           shape.particle_base_frame.load(std::memory_order_relaxed) ==
+                               VideoCommon::OotDlss::SceneFrame().load(std::memory_order_relaxed)) {
+                    oot_redraw_tonemap = OotSnapshotScene(1);
+                }
+                break;
+            }
+        }
+    }
     if (!pipeline) {
         report_failure("no pipeline");
         TraceRenderState(is_indexed, "no-pipeline", nullptr);
@@ -818,6 +985,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     if (VideoCommon::OotNetwork::BypassEnabled(Settings::GetCurrentProgramID())) {
         TrackOotTonemappedImage(*pipeline);
+    }
+    if (pipeline->UsesOotMotion()) [[unlikely]] {
+        PrepareOotObjectMotion();
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
@@ -1015,10 +1185,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
 
-#ifdef EGLANTINE_STREAMLINE
-    TrackOcarinaCamera();
-    TrackOcarinaActor(pipeline->ShaderHashes()[1], is_indexed, is_indirect);
-#endif
     TracePendingCpuWrites(false, pipeline->ShaderHashes());
     TraceRenderState(is_indexed, "configured", texture_cache.GetFramebuffer());
     if (frame_dump.Capturing()) {
@@ -1069,25 +1235,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
+        oot_motion_pipeline = pipeline->UsesOotMotion() ? pipeline : nullptr;
+        if (oot_motion_pipeline && is_indirect) [[unlikely]] {
+            PushOotObjectMotion(0, 0, 0, 0, false, false);
+        }
         draw_func();
+        oot_motion_pipeline = nullptr;
     }
     submitted = true;
-#ifdef EGLANTINE_STREAMLINE
-    constexpr u64 final_vertex = 0x16aff33d999f993fULL;
-    constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
-    const auto hashes = pipeline->ShaderHashes();
-    if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
-        std::ranges::find(hashes, final_vertex) != hashes.end()) {
-        const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
-        if (target_id) {
-            const auto& target = texture_cache.GetImageView(target_id);
-            if (target.size.width == 2560 && target.size.height == 1440 &&
-                target.format == VideoCore::Surface::PixelFormat::A8B8G8R8_SRGB) {
-                oot_4k_guest_present = target.ImageHandle();
-            }
-        }
-    }
-#endif
     if (fast_draw_on) {
         NoteResolvedDraw(pipeline, is_indexed, is_indirect);
         const size_t index = static_cast<size_t>(path);
@@ -1370,6 +1525,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         gpu.TickWork();
         return;
     }
+    oot_redraw_tonemap = false;
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
@@ -1415,6 +1571,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             return;
         }
         if (mesh_draw) {
+            if (oot_motion_pipeline) [[unlikely]] {
+                PushOotObjectMotion(draw_params.base_vertex, draw_params.num_vertices, 1, 0, false,
+                                    true);
+            }
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;
@@ -1422,6 +1582,11 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });
             return;
+        }
+        if (oot_motion_pipeline) [[unlikely]] {
+            PushOotObjectMotion(draw_params.base_vertex, draw_params.num_vertices,
+                                draw_params.num_instances, draw_params.base_instance,
+                                draw_params.is_indexed, true);
         }
         scheduler.Record([this, draw_params, hashes = trace_draw_hashes](vk::CommandBuffer cmdbuf) {
             if (scheduler.GraphicsPipelineMissing()) {
@@ -1455,6 +1620,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
         }
     });
+    if (std::exchange(oot_redraw_tonemap, false)) [[unlikely]] {
+        OotRedrawTonemap(is_indexed, instance_count);
+    }
 }
 
 void RasterizerVulkan::DrawIndirect() {
@@ -1550,16 +1718,15 @@ void RasterizerVulkan::DrawIndirect() {
 }
 
 VideoCommon::OotNetwork::BypassState* RasterizerVulkan::OotNetworkBypass() {
-#ifdef EGLANTINE_STREAMLINE
-    // NVIDIA DLSS replaces the same output pass and takes precedence until its evaluation fails.
-    if (OcarinaDlssEnabled() && !(oot_live_dlss && oot_live_dlss->EvaluationFailed())) {
+    // NVIDIA DLSS / DLAA replaces the same output pass (and copies the tonemapped image itself
+    // on a frame it cannot evaluate).
+    if (VideoCommon::OotDlss::Requested()) {
         static bool logged = false;
         if (!std::exchange(logged, true)) {
             LOG_INFO(Render_Vulkan, "Ocarina of Time: No sharpening is off while NVIDIA DLSS is on");
         }
         return nullptr;
     }
-#endif
     return &oot_network_bypass;
 }
 
@@ -2075,17 +2242,8 @@ void RasterizerVulkan::DispatchCompute() {
             texture_cache_runtime.RetireByteAddressedShadow(*byte_addressed_shadow);
         }
     };
-    const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
-#ifdef EGLANTINE_STREAMLINE
-    const bool can_replace = OcarinaDlssEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
-                             !indirect_address && !frame_dump.Capturing();
-#else
-    constexpr bool can_replace = false;
-#endif
-    ComputePipeline::BindCommand deferred_bind;
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace ? &deferred_bind : nullptr)) {
+                             texture_cache, texture_cache_runtime, byte_addressed_shadow)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
@@ -2127,6 +2285,7 @@ void RasterizerVulkan::DispatchCompute() {
         const u32 index = Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0).first;
         texture_cache.PublishComputeCollisionImage(index);
     };
+    const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
     // writes to the next render pass.
     const auto record_read_barrier = [this] {
@@ -2185,33 +2344,8 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
-#ifdef EGLANTINE_STREAMLINE
-    const auto* const replacement =
-        can_replace && !byte_addressed_shadow && TryOcarinaDlss(*pipeline, true)
-            ? oot_live_dlss.get()
-            : nullptr;
-    if (!replacement) {
-        scheduler.TraceComputePipeline(pipeline->ShaderHash());
-    }
-#else
     scheduler.TraceComputePipeline(pipeline->ShaderHash());
-#endif
-    scheduler.Record([this, pipeline, dim, byte_addressed_shadow, bind = std::move(deferred_bind)
-#ifdef EGLANTINE_STREAMLINE
-                      , replacement
-#endif
-                     ](vk::CommandBuffer cmdbuf) {
-#ifdef EGLANTINE_STREAMLINE
-        if (replacement && !replacement->EvaluationFailed()) {
-            return;
-        }
-        if (replacement) {
-            LOG_WARNING(Render_Vulkan, "Ocarina DLSS evaluation failed; dispatching native upscaler");
-        }
-#endif
-        if (bind) {
-            bind(cmdbuf);
-        }
+    scheduler.Record([this, pipeline, dim, byte_addressed_shadow](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
@@ -2224,18 +2358,8 @@ void RasterizerVulkan::DispatchCompute() {
             TextureCacheRuntime::CopyByteAddressedShadow(cmdbuf, *byte_addressed_shadow, true);
         }
     });
-    if (can_replace) {
-        // The deferred native binding may follow DLSS's command buffer bindings.
-        scheduler.InvalidateState();
-    }
     SubmitNx2ListCopies();
     publish_collision_map();
-
-#ifdef EGLANTINE_STREAMLINE
-    if (!can_replace) {
-        TryOcarinaDlss(*pipeline, false);
-    }
-#endif
 
     // Log compute dispatch
     if (GPU::Logging::IsActive() &&
@@ -2760,311 +2884,6 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
     });
 }
 
-#ifdef EGLANTINE_STREAMLINE
-bool RasterizerVulkan::OcarinaDlssEnabled() const {
-    constexpr u64 ocarina_program = 0x0400486024DEC000ULL;
-    return program_id == ocarina_program && !oot_live_failed &&
-           Settings::values.nvidia_dlss.GetValue() && Streamline::IsDlssAvailable();
-}
-
-/// Capture the two camera matrices from a draw targeting the scene color and depth. Terrain and
-/// materials draw with several vertex shaders, so any draw into a scene-sized target qualifies;
-/// the camera buffer's contents are checked below.
-void RasterizerVulkan::TrackOcarinaCamera() {
-    if (!OcarinaDlssEnabled()) {
-        return;
-    }
-
-    const auto& targets = texture_cache.GetRenderTargets();
-    if (!targets.color_buffer_ids[0] || !targets.depth_buffer_id) {
-        return;
-    }
-    const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
-    if (color.size.width < 640 || color.size.height < 360 ||
-        color.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
-        return;
-    }
-    // Reflections and half-size passes share the camera layout; the upscale reads the largest.
-    if (oot_camera_sample_frame == render_trace_frame &&
-        u64{color.size.width} * color.size.height <=
-            u64{oot_motion.extent.width} * oot_motion.extent.height) {
-        return;
-    }
-
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 bound_size,
-                                                const auto*, u32) {
-        std::array<f32, 0x230 / sizeof(f32)> camera;
-        if (stage != 0 || storage || index != 3 || bound_size < sizeof(camera) ||
-            buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(camera))) {
-            return;
-        }
-        device_memory.ReadBlockUnsafe(binding.device_addr, camera.data(), sizeof(camera));
-        constexpr size_t extent_offset = 0x120 / sizeof(f32);
-        constexpr size_t projection_wz = 0xa8 / sizeof(f32);
-        if (camera[extent_offset] != static_cast<f32>(color.size.width) ||
-            camera[extent_offset + 1] != static_cast<f32>(color.size.height) ||
-            camera[projection_wz] != -1.0f || camera[projection_wz + 1] != 0.0f) {
-            return;
-        }
-        const std::span values{camera};
-        oot_camera_sample_frame = render_trace_frame;
-        oot_motion.camera_channel = gpu_memory;
-        oot_motion.extent = {color.size.width, color.size.height};
-        std::copy_n(values.begin() + 0x30 / sizeof(f32), 16, oot_motion.current.begin());
-        std::copy_n(values.begin() + 0x180 / sizeof(f32), 16, oot_motion.previous.begin());
-    });
-}
-
-/// Capture the skinning pose of the recognized Link draw for frame-to-frame motion.
-void RasterizerVulkan::TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect) {
-    if (shader_hash != 0x28c6e527634f814aULL || !is_indexed || is_indirect ||
-        !OcarinaDlssEnabled() || oot_actor.frame == render_trace_frame) {
-        return;
-    }
-    const auto& draw = maxwell3d->draw_manager.draw_state;
-    const auto& regs = maxwell3d->regs;
-    const auto& stream = regs.vertex_streams[0];
-    if (draw.index_buffer.count != 9702 || draw.index_buffer.FormatSizeInBytes() != 2 ||
-        !stream.IsEnabled() || stream.stride != 48 || regs.vertex_stream_instances.IsInstancingEnabled(0)) {
-        return;
-    }
-    const auto attribute = [&](u32 location, VkFormat format, u32 offset) {
-        const auto& attrib = regs.vertex_attrib_format[location];
-        return attrib.buffer == 0 && !attrib.constant && attrib.offset == offset &&
-            MaxwellToVK::VertexFormat(device, attrib.type, attrib.size) == format;
-    };
-    if (!attribute(0, VK_FORMAT_R32G32B32_SFLOAT, 0) ||
-        !attribute(4, VK_FORMAT_R8G8B8A8_UNORM, 40) || !attribute(5, VK_FORMAT_R8G8B8A8_UNORM, 44) ||
-        !attribute(6, VK_FORMAT_R16G16B16A16_UINT, 12) || !attribute(7, VK_FORMAT_R16G16B16A16_UINT, 20)) {
-        return;
-    }
-
-    OcarinaActorPose pose{
-        .frame = render_trace_frame,
-        .channel = gpu_memory,
-        .vertex = stream.Address(),
-        .indices = draw.index_buffer.IndexStart(),
-        .base_vertex = static_cast<s32>(draw.base_index),
-    };
-    bool origin_found{}, bones_found{};
-    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
-                                                const auto& binding, u32 size, const auto*, u32) {
-        if (stage != 0 || storage || (index != 4 && index != 6) ||
-            buffer_cache.IsRegionGpuModified(binding.device_addr, size)) {
-            return;
-        }
-        if (index == 4 && size >= 0x40 + 3 * sizeof(f32)) {
-            device_memory.ReadBlockUnsafe(binding.device_addr + 0x40, pose.origin.data(), 3 * sizeof(f32));
-            origin_found = true;
-        }
-        if (index == 6 && size == 13568) {
-            device_memory.ReadBlockUnsafe(binding.device_addr, pose.bones.data(), sizeof(pose.bones));
-            bones_found = true;
-        }
-    });
-    if (origin_found && bones_found) {
-        oot_previous_actor = oot_actor;
-        oot_actor = pose;
-    }
-}
-
-/// Read the shared mesh only when both poses refer to the same vertex and index buffers.
-void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
-    const auto& now = oot_actor;
-    const auto& before = oot_previous_actor;
-    if (now.frame != render_trace_frame || before.frame + 1 != now.frame ||
-        now.channel != gpu_memory || before.channel != now.channel || now.vertex != before.vertex ||
-        now.indices != before.indices || now.base_vertex != before.base_vertex) {
-        return;
-    }
-    const auto read = [&](GPUVAddr address, void* dst, size_t size) {
-        if (!gpu_memory->IsContinuousRange(address, size) ||
-            !gpu_memory->IsFullyMappedRange(address, size)) {
-            return false;
-        }
-        const auto device_address = gpu_memory->GpuToCpuAddress(address);
-        if (!device_address || buffer_cache.IsRegionGpuModified(*device_address, size) ||
-            gpu.HasPendingCPUWrites(*device_address, size)) {
-            return false;
-        }
-        gpu_memory->ReadBlockUnsafe(address, dst, size);
-        return true;
-    };
-    constexpr size_t index_count = 9702;
-    constexpr size_t stride = 48;
-    std::vector<u16> indices(index_count);
-    if (!read(now.indices, indices.data(), indices.size() * sizeof(u16))) {
-        return;
-    }
-    const auto [minimum, maximum] = std::ranges::minmax(indices);
-    const s64 first = static_cast<s64>(now.base_vertex) + minimum;
-    const u32 vertex_count = static_cast<u32>(maximum) - minimum + 1;
-    if (first < 0 || first > (1 << 20) || vertex_count > 16384) {
-        return;
-    }
-    std::vector<u8> vertices(vertex_count * stride);
-    if (!read(now.vertex + first * stride, vertices.data(), vertices.size())) {
-        return;
-    }
-    for (u16& index : indices) {
-        index -= minimum;
-    }
-
-    mesh = {std::move(vertices), std::move(indices), now.origin, before.origin, now.bones, before.bones};
-}
-
-/// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
-bool RasterizerVulkan::TryOcarinaDlss(const ComputePipeline& pipeline, bool replace) {
-    constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const bool upscale_4k = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
-    if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaDlssEnabled()) {
-        return false;
-    }
-    const auto read_tic = [this](u32 index) -> std::optional<Tegra::Texture::TICEntry> {
-        const auto& table = kepler_compute->regs.tic;
-        using Entry = Tegra::Texture::TICEntry;
-        const GPUVAddr address = table.Address() + u64{index} * sizeof(Entry);
-        if (index > table.limit || !gpu_memory->IsFullyMappedRange(address, sizeof(Entry))) {
-            return std::nullopt;
-        }
-        Entry entry{};
-        gpu_memory->ReadBlockUnsafe(address, &entry, sizeof(entry));
-        return entry;
-    };
-    if (!replace) {
-        constexpr u32 depth_handle_offset = 0x128;
-        const auto& qmd = kepler_compute->launch_description;
-        const auto& cbuf = qmd.const_buffer_config[0];
-        if (!(qmd.const_buffer_enable_mask & 1) || cbuf.size < depth_handle_offset + sizeof(u32) ||
-            !gpu_memory->IsFullyMappedRange(cbuf.Address(), depth_handle_offset + sizeof(u32))) {
-            return false;
-        }
-        const u32 index = gpu_memory->Read<u32>(cbuf.Address() + depth_handle_offset) & 0xfffff;
-        const auto tic = read_tic(index);
-        const bool scene_size = oot_camera_sample_frame != render_trace_frame ||
-                                (tic && tic->Width() == oot_motion.extent.width &&
-                                 tic->Height() == oot_motion.extent.height);
-        if (tic && tic->Address() && scene_size) {
-            oot_motion.depth_channel = gpu_memory;
-            oot_motion.depth_frame = render_trace_frame;
-            oot_motion.depth_tic = index;
-            oot_motion.depth_address = tic->Address();
-        }
-        return false;
-    }
-    // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
-    const auto fail = [this](const char* reason) {
-        if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
-            LOG_INFO(Render_Vulkan, "Ocarina DLSS: the game's upscale draws frame {} ({})",
-                     render_trace_frame, reason);
-        }
-        if (reason != oot_fallback_reason) {
-            oot_fallback_reason = reason;
-            oot_fallback_repeats = 0;
-        }
-        return false;
-    };
-    if (oot_camera_sample_frame != render_trace_frame) {
-        return fail("no scene camera this frame");
-    }
-    if (oot_motion.depth_frame != render_trace_frame) {
-        return fail("no scene depth this frame");
-    }
-    if (oot_motion.camera_channel != gpu_memory || oot_motion.depth_channel != gpu_memory) {
-        return fail("camera and depth from another channel");
-    }
-    const auto tic = read_tic(oot_motion.depth_tic);
-    if (!tic || tic->Address() != oot_motion.depth_address ||
-        tic->Width() != oot_motion.extent.width || tic->Height() != oot_motion.extent.height) {
-        return fail("scene depth descriptor changed");
-    }
-
-    texture_cache.SynchronizeDescriptors(true);
-    std::array images{VideoCommon::ImageViewInOut{.index = oot_motion.depth_tic}};
-    texture_cache.FillImageViews(images, true);
-    if (!images[0].id) {
-        return fail("no scene depth image");
-    }
-    auto& depth = texture_cache.GetImageView(images[0].id);
-    const auto* backing = depth.BackingImage();
-    if (!backing || depth.IsRescaled() || depth.format != VideoCore::Surface::PixelFormat::D32_FLOAT ||
-        depth.range != VideoCommon::SubresourceRange{} || backing->info.num_samples != 1) {
-        return fail("unsupported scene depth");
-    }
-
-    const auto sampled = pipeline.SampledImages();
-    const auto written = pipeline.WrittenImages();
-    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0]) {
-        return fail("unexpected upscale bindings");
-    }
-    const auto& color = texture_cache.GetImageView(sampled[0].id);
-    auto& target = texture_cache.GetImageView(written[0]);
-    using VideoCore::Surface::PixelFormat;
-    const auto extent = oot_motion.extent;
-    const bool valid_extents = upscale_4k
-        ? extent.width == 2560 && extent.height == 1440 &&
-            target.size.width == 2560 && target.size.height == 1440
-        : target.size.width == extent.width * 4 / 3 &&
-            target.size.height == extent.height * 4 / 3;
-    if (!valid_extents || !color.BackingImage() || !target.BackingImage() ||
-        color.IsRescaled() || target.IsRescaled() ||
-        color.Samples() != VK_SAMPLE_COUNT_1_BIT || target.Samples() != VK_SAMPLE_COUNT_1_BIT ||
-        color.range != VideoCommon::SubresourceRange{} || target.range != VideoCommon::SubresourceRange{} ||
-        color.format != PixelFormat::E5B9G9R9_FLOAT || target.format != PixelFormat::B10G11R11_FLOAT ||
-        color.size.width != extent.width || color.size.height != extent.height ||
-        color.ImageHandle() == target.ImageHandle() || depth.ImageHandle() == target.ImageHandle()) {
-        return fail("unexpected upscale images");
-    }
-
-    constexpr VkFormat output_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    const auto color_view = color.Handle(Shader::TextureType::Color2D);
-    if (!color_view || !device.IsStorageImageExtendedFormatsSupported() ||
-        !device.IsFormatSupported(output_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT, FormatType::Optimal) ||
-        (target.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) == 0 ||
-        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target.format).format != output_format) {
-        return fail("unsupported storage format");
-    }
-    // Without Link's pose the mesh stays empty and the motion comes from the camera alone.
-    OcarinaActorMesh mesh;
-    ReadOcarinaActor(mesh);
-    try {
-        const auto target_view =
-            target.StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
-        const auto scene_reference = upscale_4k ? target.Handle(Shader::TextureType::Color2D)
-                                                : VK_NULL_HANDLE;
-        if (!target_view || (upscale_4k && !scene_reference)) {
-            return fail("no upscale target view");
-        }
-        if (!oot_live_dlss) {
-            oot_live_dlss = std::make_unique<OcarinaLiveDlss>(
-                device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
-        }
-        const VkExtent2D target_extent{target.size.width, target.size.height};
-        const VkExtent2D output_extent = upscale_4k ? VkExtent2D{3840, 2160} : target_extent;
-        const bool recorded = oot_live_dlss->Record(color_view, depth.DepthView(), target_view,
-                                                   extent, output_extent, target_extent, oot_motion.current,
-                                                   oot_motion.previous, mesh, depth.ImageHandle(),
-                                                   render_trace_frame);
-        if (!recorded) {
-            return fail("DLSS declined the frame");
-        }
-        if (upscale_4k) {
-            oot_live_dlss->SaveSceneReference(scene_reference);
-            oot_4k_scene_frame = render_trace_frame;
-            oot_4k_guest_present = VK_NULL_HANDLE;
-        }
-        oot_dlss_frame = render_trace_frame;
-        oot_fallback_reason = nullptr;
-        return true;
-    } catch (const vk::Exception& error) {
-        LOG_WARNING(Render_Vulkan, "Ocarina DLSS unavailable: {}", error.what());
-        oot_live_failed = true;
-        return false;
-    }
-}
-#endif
-
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
     static constexpr u32 BUFFER_CAP = 4U << 20;
     std::vector<FrameDump::BoundBuffer> buffers;
@@ -3109,6 +2928,16 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    if (oot_object_motion) {
+        oot_object_motion->EnsureImage(scheduler, OotObjectMotionSize());
+    }
+    if (VideoCommon::OotDlss::Requested()) {
+        const u64 frame = VideoCommon::OotDlss::FrameCounter().fetch_add(1, std::memory_order_relaxed);
+        if (frame % 600 == 599) {
+            LOG_INFO(Render_Vulkan, "OoT DLSS: {} jittered viewport updates in the last 600 frames",
+                     std::exchange(oot_jittered_updates, 0));
+        }
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
@@ -3252,6 +3081,18 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
                                           use_history);
 }
 
+bool RasterizerVulkan::AccelerateOotDlss(const Tegra::Engines::Fermi2D::Surface& src,
+                                         const Tegra::Engines::Fermi2D::Surface& dst,
+                                         const Tegra::Texture::TICEntry& depth,
+                                         std::array<f32, 2> jitter,
+                                         const std::array<f32, 16>& reproject, bool flip_y,
+                                         bool reset) {
+    std::scoped_lock lock{texture_cache.mutex};
+    return texture_cache.OotDlss(dst, src, depth, jitter, reproject, flip_y, reset, false,
+                                 oot_effects_rt ? &*oot_effects_rt : nullptr,
+                                 oot_fog_rt ? &*oot_fog_rt : nullptr);
+}
+
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {
     return accelerate_dma;
 }
@@ -3347,26 +3188,6 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     info.height = image_view->size.height;
     info.scaled_width = scaled ? resolution.ScaleUp(info.width) : info.width;
     info.scaled_height = scaled ? resolution.ScaleUp(info.height) : info.height;
-#ifdef EGLANTINE_STREAMLINE
-    info.anti_aliased = oot_dlss_frame == render_trace_frame && !oot_live_dlss->EvaluationFailed();
-    if (oot_4k_scene_frame == render_trace_frame && info.image &&
-        info.image == oot_4k_guest_present && info.image_view &&
-        info.width == 2560 && info.height == 1440 && !scaled &&
-        image_view->format == VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM &&
-        !oot_live_dlss->EvaluationFailed() && !frame_dump.Capturing()) {
-        try {
-            oot_live_dlss->Composite4k(info.image_view, render_trace_frame);
-            info.image = oot_live_dlss->CompositedImage();
-            info.image_view = oot_live_dlss->CompositedView();
-            info.scaled_width = 3840;
-            info.scaled_height = 2160;
-            info.already_upscaled = true;
-        } catch (const vk::Exception& error) {
-            LOG_WARNING(Render_Vulkan, "Ocarina DLSS 4K presentation unavailable: {}", error.what());
-            oot_live_failed = true;
-        }
-    }
-#endif
     return info;
 }
 
@@ -3612,10 +3433,645 @@ void RasterizerVulkan::HandleTransformFeedback() {
     }
 }
 
-void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchViewports()) {
+void RasterizerVulkan::CaptureOotCamera() {
+    using namespace VideoCommon::OotDlss;
+    const auto& regs = maxwell3d->regs;
+    const u64 depth = Targets().depth_gpu.load(std::memory_order_relaxed);
+    if (depth == 0 || !regs.zeta_enable || regs.zeta.Address() != depth) {
         return;
     }
+    Camera& camera = CurrentCamera();
+    const u64 frame = SceneFrame().load(std::memory_order_relaxed);
+    std::scoped_lock lock{camera.mutex};
+    if (camera.frame != frame) {
+        // Last frame's view-projection is this frame's previous one.
+        camera.has_last = camera.found && camera.frame + 1 == frame;
+        camera.last_view_projection = camera.view_projection;
+        camera.frame = frame;
+        camera.valid = false;
+        camera.found = false;
+        camera.moving = false;
+        camera.searched = 0;
+    }
+    if (camera.found) {
+        return;
+    }
+    // Camera motion is this frame's view-projection against last frame's, as captured here. The
+    // game's own "previous" matrices don't follow the frames drawn: on a pan their motion matched
+    // the static scenery's object motion in direction only once the pair was swapped, and not in
+    // length. Which of a pair is this frame's also depends on the shader.
+    const auto distance = [](const float* a, const float* b) {
+        float difference = 0.0f, magnitude = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            difference += std::abs(a[i] - b[i]);
+            magnitude += std::abs(a[i]);
+        }
+        return std::pair{difference, magnitude};
+    };
+    static std::pair<u32, u32> logged{~0u, ~0u};
+    // Of the camera's pair (`low` before `high` in the buffer), whether `high` is this frame's:
+    // it is (seen: c[7] +0x100), unless it is clearly the one last frame's capture is close to.
+    // The older matrix need not be last frame's, so "further from last frame's" alone can't
+    // tell them apart.
+    // With a still camera both match last frame's up to float noise, which then picked the other
+    // one every frame: a back-and-forth motion of ~0.1 px while standing still (indoors). There
+    // the slot taken last frame (`prefer_high`) stays.
+    const auto high_is_current = [&](const float* low, const float* high, bool prefer_high) {
+        if (!camera.has_last) {
+            return prefer_high;
+        }
+        const auto [to_low, magnitude] = distance(low, camera.last_view_projection.data());
+        const float to_high = distance(high, camera.last_view_projection.data()).first;
+        if ((std::max)(to_low, to_high) < 1e-4f * magnitude) {
+            return prefer_high;
+        }
+        return !(to_high < 0.5f * to_low);
+    };
+    const auto take = [&](u32 index, u32 offset, u32 partner, const float* current) {
+        if (camera.has_last) {
+            // Another camera (a different view drawn into the scene depth) is not this one.
+            const auto [difference, magnitude] =
+                distance(current, camera.last_view_projection.data());
+            if (difference > 0.3f * magnitude) {
+                return false;
+            }
+        }
+        std::array<float, 16> view_projection{};
+        std::copy_n(current, 16, view_projection.begin());
+        const auto inverse = Inverse(view_projection);
+        if (!inverse) {
+            return false;
+        }
+        const auto& previous = camera.has_last ? camera.last_view_projection : view_projection;
+        const auto reproject = Multiply(previous, *inverse);
+        if (!std::ranges::all_of(reproject, [](float v) { return std::isfinite(v); })) {
+            return false;
+        }
+        camera.reproject = reproject;
+        camera.view_projection = view_projection;
+        camera.valid = true;
+        camera.found = true;
+        camera.moving = previous != view_projection;
+        camera.known_index = index;
+        camera.known_offset = offset;
+        camera.known_partner = partner;
+        // EDEN_OOT_CAMERA_TRACE=1: per frame, the capture and the screen centre's camera motion.
+        static const bool trace = [] {
+            const char* value = std::getenv("EDEN_OOT_CAMERA_TRACE");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (trace) {
+            constexpr float z = 0.9f;
+            const float w = reproject[14] * z + reproject[15];
+            std::array<float, 16> other{};
+            gpu_memory->ReadBlockUnsafe(
+                maxwell3d->state.shader_stages[0].const_buffers[index].address + partner,
+                other.data(), 64);
+            const float to_last =
+                camera.has_last ? distance(current, camera.last_view_projection.data()).first
+                                : -1.0f;
+            const float partner_to_last =
+                camera.has_last ? distance(other.data(), camera.last_view_projection.data()).first
+                                : -1.0f;
+            // How much each slot changed since last frame's capture (a still view: the slot the
+            // game renders with stays the same).
+            static std::unordered_map<u32, std::array<float, 16>> slot_last;
+            const auto changed = [&](u32 slot, const float* matrix) {
+                std::array<float, 16> value{};
+                std::copy_n(matrix, 16, value.begin());
+                const auto it = slot_last.find(slot);
+                const float result =
+                    it != slot_last.end() ? distance(matrix, it->second.data()).first : -1.0f;
+                slot_last[slot] = value;
+                return result;
+            };
+            const float own_change = changed(offset, current);
+            const float partner_change = changed(partner, other.data());
+            // The scene constants' view-projection pair (c[3] +0x30 / +0x180), for comparison.
+            float c3_change = -1.0f;
+            float c3_pair = -1.0f;
+            if (const auto& c3 = maxwell3d->state.shader_stages[0].const_buffers[3];
+                c3.enabled && c3.size >= 0x1c0 &&
+                gpu_memory->IsFullyMappedRange(c3.address, 0x1c0)) {
+                std::array<float, 16> a{};
+                std::array<float, 16> b{};
+                gpu_memory->ReadBlockUnsafe(c3.address + 0x30, a.data(), 64);
+                gpu_memory->ReadBlockUnsafe(c3.address + 0x180, b.data(), 64);
+                c3_pair = distance(a.data(), b.data()).first;
+                c3_change = changed(0x10000 | 0x30, a.data());
+            }
+            LOG_INFO(Render_Vulkan, "OoT DLSS camera trace: c[3]+0x30 change {:.4f}, to +0x180 {:.4f}",
+                     c3_change, c3_pair);
+            // Every perspective matrix the vertex stage sees, with its change since last frame.
+            std::string all;
+            for (u32 slot = 0; slot < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+                const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[slot];
+                const u32 size = cbuf.enabled ? (std::min)(cbuf.size, 0x800u) & ~15u : 0;
+                if (size < 64 || !gpu_memory->IsFullyMappedRange(cbuf.address, size)) {
+                    continue;
+                }
+                std::array<float, 0x200> words{};
+                gpu_memory->ReadBlockUnsafe(cbuf.address, words.data(), size);
+                for (u32 at = 0; at + 64 <= size; at += 16) {
+                    if (IsPerspective(words.data() + at / 4)) {
+                        all += fmt::format(" c[{}]+{:#x}:{:.4f}", slot, at,
+                                           changed(0x20000 | (slot << 12) | at,
+                                                   words.data() + at / 4));
+                    }
+                }
+            }
+            LOG_INFO(Render_Vulkan, "OoT DLSS camera trace: all{}", all);
+            LOG_INFO(Render_Vulkan,
+                     "OoT DLSS camera trace: frame {} c[{}] {:#x} ({:.4f} from last; partner {:#x} "
+                     "{:.4f}), slot changes {:.4f} / {:.4f}, centre motion {:.5f} {:.5f} NDC",
+                     frame, index, offset, to_last, partner, partner_to_last, own_change,
+                     partner_change, w != 0.0f ? (reproject[2] * z + reproject[3]) / w : 0.0f,
+                     w != 0.0f ? (reproject[6] * z + reproject[7]) / w : 0.0f);
+        }
+        static u32 changes{};
+        if (std::pair{index, offset} != logged && changes < 32) {
+            logged = {index, offset};
+            ++changes;
+            LOG_INFO(Render_Vulkan, "OoT DLSS camera: c[{}] view-projection at {:#x}", index,
+                     offset);
+        }
+        return true;
+    };
+    // Where the camera's pair was found last: checked on every scene draw, since only some
+    // shaders bind it.
+    if (camera.known_index != ~0u) {
+        const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[camera.known_index];
+        const u32 low_offset = (std::min)(camera.known_offset, camera.known_partner);
+        const u32 high_offset = (std::max)(camera.known_offset, camera.known_partner);
+        if (cbuf.enabled && cbuf.size >= high_offset + 64 &&
+            gpu_memory->IsFullyMappedRange(cbuf.address, high_offset + 64)) {
+            std::array<float, 16> low{};
+            std::array<float, 16> high{};
+            gpu_memory->ReadBlockUnsafe(cbuf.address + low_offset, low.data(), 64);
+            gpu_memory->ReadBlockUnsafe(cbuf.address + high_offset, high.data(), 64);
+            if (IsPerspective(low.data()) && IsPerspective(high.data())) {
+                const bool high_current = high_is_current(low.data(), high.data(),
+                                                           camera.known_offset == high_offset);
+                if (take(camera.known_index, high_current ? high_offset : low_offset,
+                         high_current ? low_offset : high_offset,
+                         high_current ? high.data() : low.data())) {
+                    return;
+                }
+            }
+        }
+    }
+    if (camera.searched >= 64) {
+        return;
+    }
+    ++camera.searched;
+    // The scene draws' vertex constant buffers hold pairs of close perspective matrices at
+    // offsets that differ between shaders. The camera's pair holds this frame's view-projection
+    // and an older one (c[7] +0xc0 / +0x100; this frame's is the one further from last frame's
+    // capture, else the second). Some buffers hold one matrix twice (c[3] +0xa0 / +0x270) that
+    // stays the same on a pan: it only stands in, with no camera motion, until the camera is
+    // found, and is never remembered.
+    constexpr u32 MaxBytes = 0x800;
+    std::array<float, MaxBytes / 4> words{};
+    for (u32 slot = 0; slot < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+        const u32 index = slot == 0 ? 3 : (slot == 3 ? 0 : slot);
+        const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[index];
+        const u32 size = cbuf.enabled ? (std::min)(cbuf.size, MaxBytes) & ~15u : 0;
+        if (size < 128 || !gpu_memory->IsFullyMappedRange(cbuf.address, size)) {
+            continue;
+        }
+        gpu_memory->ReadBlockUnsafe(cbuf.address, words.data(), size);
+        boost::container::small_vector<u32, 8> candidates;
+        for (u32 offset = 0; offset + 64 <= size; offset += 16) {
+            if (IsPerspective(words.data() + offset / 4)) {
+                candidates.push_back(offset);
+            }
+        }
+        for (size_t a = 0; a < candidates.size(); ++a) {
+            for (size_t b = a + 1; b < candidates.size(); ++b) {
+                if (candidates[b] < candidates[a] + 64) {
+                    continue; // overlapping rows of one matrix
+                }
+                const float* first = words.data() + candidates[a] / 4;
+                const float* second = words.data() + candidates[b] / 4;
+                const auto [difference, magnitude] = distance(first, second);
+                if (difference > 0.3f * magnitude) {
+                    continue;
+                }
+                if (difference == 0.0f) {
+                    if (!camera.valid) {
+                        // No camera motion, until the camera is found.
+                        std::copy_n(first, 16, camera.view_projection.begin());
+                        const auto inverse = Inverse(camera.view_projection);
+                        if (inverse) {
+                            camera.reproject = Multiply(camera.view_projection, *inverse);
+                            camera.valid = true;
+                        }
+                    }
+                    continue;
+                }
+                const u32 offset =
+                    high_is_current(first, second,
+                                    !(camera.known_index == index &&
+                                      camera.known_offset == candidates[a]))
+                        ? candidates[b]
+                        : candidates[a];
+                const u32 partner = offset == candidates[a] ? candidates[b] : candidates[a];
+                if (take(index, offset, partner, words.data() + offset / 4)) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+void RasterizerVulkan::OotRedrawTonemap(bool is_indexed, u32 instance_count) {
+    using namespace VideoCommon::OotDlss;
+    using Tegra::Engines::Fermi2D;
+    auto& targets = Targets();
+    const u64 tonemapped = targets.tonemapped_gpu.load(std::memory_order_relaxed);
+    const u32 layout = targets.tonemapped_layout.load(std::memory_order_relaxed);
+    if (tonemapped == 0 || (layout & (3u << 12)) != 0) {
+        return;
+    }
+    Fermi2D::Surface image{};
+    image.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    image.linear = Fermi2D::MemoryLayout::BlockLinear;
+    image.block_width.Assign(layout & 0xf);
+    image.block_height.Assign((layout >> 4) & 0xf);
+    image.block_depth.Assign((layout >> 8) & 0xf);
+    image.depth = 1;
+    image.width = targets.tonemapped_width.load(std::memory_order_relaxed);
+    image.height = targets.tonemapped_height.load(std::memory_order_relaxed);
+    image.addr_upper = static_cast<u32>(tonemapped >> 32);
+    image.addr_lower = static_cast<u32>(tonemapped);
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        if (!texture_cache.OotSnapshotScene(image, 2)) {
+            NoteFallback("tonemapped image not copied");
+            return;
+        }
+    }
+    if (!OotSnapshotScene(0, true)) {
+        return;
+    }
+    oot_redrawing = true;
+    Draw(is_indexed, instance_count);
+    oot_redrawing = false;
+    OotSnapshotScene(1, true);
+    targets.particle_frame.store(SceneFrame().load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+}
+
+bool RasterizerVulkan::OotSnapshotScene(u32 which, bool restore) {
+    using namespace VideoCommon::OotDlss;
+    using Tegra::Engines::Fermi2D;
+    auto& targets = Targets();
+    const u64 colour = targets.color_gpu.load(std::memory_order_relaxed);
+    std::optional<Tegra::Texture::TICEntry> output_tic;
+    {
+        std::scoped_lock lock{targets.depth_mutex};
+        output_tic = targets.output_tic;
+    }
+    if (colour == 0 || !output_tic) {
+        return false;
+    }
+    // The scene colour has the network output's size, format and layout.
+    Fermi2D::Surface scene{};
+    scene.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    scene.linear = Fermi2D::MemoryLayout::BlockLinear;
+    scene.block_width.Assign(output_tic->block_width);
+    scene.block_height.Assign(output_tic->block_height);
+    scene.block_depth.Assign(output_tic->block_depth);
+    scene.depth = 1;
+    scene.width = output_tic->Width();
+    scene.height = output_tic->Height();
+    scene.addr_upper = static_cast<u32>(colour >> 32);
+    scene.addr_lower = static_cast<u32>(colour);
+    const u64 frame = SceneFrame().load(std::memory_order_relaxed);
+    std::scoped_lock lock{texture_cache.mutex};
+    if (!texture_cache.OotSnapshotScene(scene, which, restore)) {
+        NoteFallback("scene colour not copied");
+        return false;
+    }
+    if (which == 0 && !restore) {
+        targets.particle_base_frame.store(frame, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void RasterizerVulkan::OotDlssBeforeTonemap() {
+    using namespace VideoCommon::OotDlss;
+    using Tegra::Engines::Fermi2D;
+    auto& targets = Targets();
+    const u64 scene_frame = SceneFrame().load(std::memory_order_relaxed);
+    if (targets.hdr_frame.load(std::memory_order_relaxed) == scene_frame) {
+        return;
+    }
+    const u64 colour = targets.color_gpu.load(std::memory_order_relaxed);
+    std::optional<Tegra::Texture::TICEntry> depth_tic;
+    std::optional<Tegra::Texture::TICEntry> output_tic;
+    {
+        std::scoped_lock lock{targets.depth_mutex};
+        depth_tic = targets.depth_tic;
+        output_tic = targets.output_tic;
+    }
+    std::array<float, 16> reproject{};
+    bool valid{};
+    {
+        Camera& camera = CurrentCamera();
+        std::scoped_lock lock{camera.mutex};
+        valid = camera.valid;
+        reproject = camera.reproject;
+    }
+    if (colour == 0 || !depth_tic || !output_tic || !valid) {
+        NoteFallback(colour == 0    ? "scene colour not seen yet"
+                     : !depth_tic   ? "scene depth not seen yet"
+                     : !output_tic  ? "network output not seen yet"
+                                    : "camera not found");
+        return;
+    }
+    // The scene colour has the network output's size, format and layout.
+    const auto surface = [&](u64 address) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(output_tic->block_width);
+        result.block_height.Assign(output_tic->block_height);
+        result.block_depth.Assign(output_tic->block_depth);
+        result.depth = 1;
+        result.width = output_tic->Width();
+        result.height = output_tic->Height();
+        result.addr_upper = static_cast<u32>(address >> 32);
+        result.addr_lower = static_cast<u32>(address);
+        return result;
+    };
+    const Fermi2D::Surface output = surface(output_tic->Address());
+    const Fermi2D::Surface scene = surface(colour);
+    const s32 width = static_cast<s32>(output_tic->Width());
+    const s32 height = static_cast<s32>(output_tic->Height());
+    const Fermi2D::Config copy{
+        .operation = Fermi2D::Operation::SrcCopy,
+        .filter = Fermi2D::Filter::Point,
+        .must_accelerate = true,
+        .dst_x0 = 0,
+        .dst_y0 = 0,
+        .dst_x1 = width,
+        .dst_y1 = height,
+        .src_x0 = 0,
+        .src_y0 = 0,
+        .src_x1 = width,
+        .src_y1 = height,
+    };
+    std::scoped_lock lock{texture_cache.mutex};
+    // DLSS writes the network output's image (free until the network pass), then that goes
+    // back over the scene colour the tonemap reads.
+    if (!texture_cache.OotDlss(output, scene, *depth_tic, ReportedJitter(scene_frame), reproject, FlipY(),
+                               HistoryReset(), true,
+                               // The particles are drawn after DLSS; the effects mask only
+                               // cost the rest of the effects layer its anti-aliasing.
+                               oot_effects_rt && HdrDlssStage() == HdrStage::Tonemap
+                                   ? &*oot_effects_rt
+                                   : nullptr,
+                               oot_fog_rt ? &*oot_fog_rt : nullptr)) {
+        return;
+    }
+    // Marked even if the copy back fails: the network pass must not evaluate DLSS twice.
+    targets.hdr_frame.store(scene_frame, std::memory_order_relaxed);
+    if (!texture_cache.BlitImage(scene, output, copy)) {
+        NoteFallback("HDR result not copied back");
+        return;
+    }
+    static bool logged{};
+    if (!std::exchange(logged, true)) {
+        LOG_INFO(Render_Vulkan, "OoT DLSS: running on the HDR scene colour {:#x} before the tonemap",
+                 colour);
+    }
+}
+
+void RasterizerVulkan::OotSceneEnd() {
+    if (oot_object_motion) {
+        oot_object_motion->BeginFrame(scheduler);
+    }
+}
+
+void RasterizerVulkan::PrepareOotObjectMotion() {
+    // The image only changes size in TickFrame: fast draws reuse descriptors within a frame.
+    if (!oot_object_motion) {
+        oot_object_motion = std::make_unique<OotObjectMotion>(device, memory_allocator);
+        oot_object_motion->EnsureImage(scheduler, OotObjectMotionSize());
+    }
+}
+
+VkExtent2D RasterizerVulkan::OotObjectMotionSize() const {
+    const auto& targets = VideoCommon::OotDlss::Targets();
+    u32 width = targets.depth_width.load(std::memory_order_relaxed);
+    u32 height = targets.depth_height.load(std::memory_order_relaxed);
+    if (width == 0 || height == 0) {
+        return VkExtent2D{1, 1};
+    }
+    if (VideoCommon::OotDlss::SceneRescaled()) {
+        width = Settings::values.resolution_info.ScaleUp(width);
+        height = Settings::values.resolution_info.ScaleUp(height);
+    }
+    return VkExtent2D{width, height};
+}
+
+std::optional<std::pair<u32, u32>> RasterizerVulkan::OotIndexBounds() {
+    const auto& index_buffer = maxwell3d->draw_manager.draw_state.index_buffer;
+    const auto& restart = maxwell3d->regs.primitive_restart;
+    const u64 key = (index_buffer.IndexStart() * 0x9E3779B97F4A7C15ULL) ^
+                    (u64{index_buffer.count} << 32) ^
+                    (static_cast<u64>(index_buffer.format) << 60) ^
+                    (restart.enabled ? u64{restart.index} * 0xC2B2AE3D27D4EB4FULL : 0);
+    if (const auto it = oot_index_bounds.find(key); it != oot_index_bounds.end()) {
+        return it->second;
+    }
+    const size_t index_size = index_buffer.FormatSizeInBytes();
+    const size_t bytes = size_t{index_buffer.count} * index_size;
+    constexpr size_t MaxBytes = size_t{16} << 20;
+    if (bytes == 0 || bytes > MaxBytes ||
+        !gpu_memory->IsFullyMappedRange(index_buffer.IndexStart(), bytes)) {
+        return std::nullopt;
+    }
+    oot_index_scratch.resize(bytes);
+    gpu_memory->ReadBlockUnsafe(index_buffer.IndexStart(), oot_index_scratch.data(), bytes);
+    u32 low = ~0u;
+    u32 high = 0;
+    const u32 restart_index = restart.enabled ? restart.index : ~0u;
+    const auto scan = [&](const auto* indices) {
+        for (u32 i = 0; i < index_buffer.count; ++i) {
+            const u32 value = indices[i];
+            if (value == restart_index) {
+                continue;
+            }
+            low = (std::min)(low, value);
+            high = (std::max)(high, value);
+        }
+    };
+    switch (index_size) {
+    case 1:
+        scan(oot_index_scratch.data());
+        break;
+    case 2:
+        scan(reinterpret_cast<const u16*>(oot_index_scratch.data()));
+        break;
+    default:
+        scan(reinterpret_cast<const u32*>(oot_index_scratch.data()));
+        break;
+    }
+    if (low > high) {
+        return std::nullopt;
+    }
+    if (oot_index_bounds.size() > 65536) {
+        oot_index_bounds.clear();
+    }
+    oot_index_bounds.emplace(key, std::make_pair(low, high));
+    return std::make_pair(low, high);
+}
+
+void RasterizerVulkan::PushOotObjectMotion(u32 base_vertex, u32 num_vertices, u32 num_instances,
+                                           u32 base_instance, bool is_indexed, bool enabled) {
+    GraphicsPipeline* const pipeline = std::exchange(oot_motion_pipeline, nullptr);
+    if (!pipeline) {
+        return;
+    }
+    using Layout = OotObjectMotion::Layout;
+    Layout data{.flags = 0};
+    const auto& regs = maxwell3d->regs;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& targets = VideoCommon::OotDlss::Targets();
+    const u32 depth_width = targets.depth_width.load(std::memory_order_relaxed);
+    const u32 depth_height = targets.depth_height.load(std::memory_order_relaxed);
+    const bool scene = depth_width != 0 && regs.zeta_enable && regs.zeta.Address() != 0 &&
+                       regs.zeta_size.width == depth_width &&
+                       regs.zeta_size.height == depth_height &&
+                       regs.zeta.format == Tegra::DepthFormat::Z32_FLOAT &&
+                       // Only draws that leave their depth can be told apart from what covers
+                       // them (fullscreen fog and lighting passes write no depth).
+                       regs.depth_test_enable != 0 && regs.depth_write_enabled != 0;
+    const bool quads = draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
+                       draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip;
+    const VkExtent2D size = OotObjectMotionSize();
+    const bool sized = oot_object_motion && oot_object_motion->HasImage() && size.width > 1 &&
+                       oot_object_motion->Extent().width == size.width &&
+                       oot_object_motion->Extent().height == size.height;
+    if (const u32 mesh_vertices = pipeline->OotMeshMaxVertices();
+        enabled && scene && sized && mesh_vertices != 0) {
+        // Mesh draw: `num_vertices` workgroups, each with its own run of history slots.
+        const auto& hashes = pipeline->ShaderHashes();
+        u64 identity = 0x84222325cbf29ce4ULL;
+        for (const u64 value : {hashes[1], hashes[2], hashes[5], u64{base_vertex},
+                                u64{num_vertices}, u64{mesh_vertices}}) {
+            identity = (identity ^ value) * 0x100000001b3ULL;
+            identity ^= identity >> 31;
+        }
+        constexpr u32 MaxWorkgroups = 1u << 16;
+        if (const u32 words = pipeline->OotMeshShadowWords(); words != 0) {
+            // Snapshot of the constant buffer words its shadow evaluation reads, four per slot:
+            // this frame's for the next, last frame's for this one. A mesh drawn several times a
+            // frame (its constant buffers move every frame) takes last frame's snapshot at the
+            // same place in the draw order; the mesh stage drops shadow positions far from the
+            // current ones.
+            data = oot_object_motion->Allocate(identity, Common::DivCeil(words, 4u), 1, 0, 0,
+                                               true);
+            data.vertex_range = num_vertices;
+            data.image_width = size.width;
+        } else if (num_vertices != 0 && num_vertices <= MaxWorkgroups) {
+            // Two history entries per vertex (position, signature: EmitOotMotionMeshVertex).
+            data = oot_object_motion->Allocate(identity, mesh_vertices * 2, num_vertices, 0, 0);
+            data.vertex_range = num_vertices;
+            data.image_width = size.width;
+        }
+    } else if (enabled && scene && !quads && sized) {
+        // Vertices per instance: the draw's own for plain draws; for indexed ones the range
+        // its indices span (VertexIndex is the index plus the base vertex).
+        u64 range = num_vertices;
+        u32 vertex_bias = base_vertex;
+        if (is_indexed) {
+            range = 0;
+            if (const auto bounds = OotIndexBounds()) {
+                range = u64{bounds->second} - bounds->first + 1;
+                vertex_bias = base_vertex + bounds->first;
+            }
+        }
+        constexpr u64 MaxRange = u64{1} << 20;
+        if (range != 0 && range <= MaxRange) {
+            const auto& hashes = pipeline->ShaderHashes();
+            u64 identity = 0xcbf29ce484222325ULL;
+            const auto mix = [&identity](u64 value) {
+                identity = (identity ^ value) * 0x100000001b3ULL;
+                identity ^= identity >> 31;
+            };
+            mix(hashes[1]);
+            mix(hashes[5]);
+            mix(is_indexed);
+            mix(base_vertex);
+            mix(num_vertices);
+            mix(num_instances);
+            mix(base_instance);
+            mix(range);
+            if (is_indexed) {
+                mix(draw_state.index_buffer.StartAddress());
+                mix(static_cast<u64>(draw_state.index_buffer.format));
+                mix(draw_state.index_buffer.first);
+            }
+            for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
+                mix(regs.vertex_streams[index].IsEnabled() ? regs.vertex_streams[index].stride
+                                                           : 0);
+            }
+            data = oot_object_motion->Allocate(identity, static_cast<u32>(range), num_instances,
+                                               vertex_bias, base_instance);
+            data.image_width = size.width;
+        }
+    }
+    scheduler.Record([this, pipeline, data](vk::CommandBuffer cmdbuf) {
+        if (scheduler.GraphicsPipelineMissing()) {
+            return;
+        }
+        cmdbuf.PushConstants(pipeline->PipelineLayout(), pipeline->PushConstantStages(),
+                             Shader::Backend::SPIRV::OOT_MOTION_OFFSET, sizeof(data), &data);
+    });
+}
+
+std::array<float, 2> RasterizerVulkan::OotDlssViewportJitter(
+    const Tegra::Engines::Maxwell3D::Regs& regs) const {
+    if (!VideoCommon::OotDlss::Requested() ||
+        Settings::GetCurrentProgramID() != VideoCommon::OotDlss::ProgramId) {
+        return {};
+    }
+    const auto& targets = VideoCommon::OotDlss::Targets();
+    const u32 width = targets.depth_width.load(std::memory_order_relaxed);
+    const u32 height = targets.depth_height.load(std::memory_order_relaxed);
+    if (width == 0 || !regs.zeta_enable || regs.zeta.Address() == 0 ||
+        regs.zeta_size.width != width || regs.zeta_size.height != height ||
+        regs.zeta.format != Tegra::DepthFormat::Z32_FLOAT) {
+        return {};
+    }
+    // Only the scene's geometry: full-screen passes (the tonemap) keep the scene depth bound but
+    // neither test nor write it. Jittered, they shifted an already jittered image again (twice
+    // the jitter DLSS was told) or, after DLSS on the HDR path, shook the finished image.
+    if (!regs.depth_test_enable && !regs.depth_write_enabled) {
+        return {};
+    }
+    const u64 frame = VideoCommon::OotDlss::SceneFrame().load(std::memory_order_relaxed);
+    if (targets.hdr_frame.load(std::memory_order_relaxed) == frame ||
+        targets.particle_base_frame.load(std::memory_order_relaxed) == frame) {
+        // DLSS already ran this frame (HdrInput), or the particles are drawing (DLSS takes them
+        // from the current frame): nothing after it is jittered.
+        return {};
+    }
+    return VideoCommon::OotDlss::Jitter(frame);
+}
+
+void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs) {
+    // The jitter depends on the bound depth target and the frame, which the viewport dirty flag
+    // does not track: re-send the viewports whenever it changes.
+    const std::array<float, 2> jitter = OotDlssViewportJitter(regs);
+    const bool jitter_changed = jitter != applied_viewport_jitter;
+    if (!state_tracker.TouchViewports() && !jitter_changed) {
+        return;
+    }
+    applied_viewport_jitter = jitter;
 
     maxwell3d->dirty.flags[Dirty::Scissors] = true;
 
@@ -3647,7 +4103,7 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const float scale = is_rescaling ? Settings::values.resolution_info.up_factor : 1.0f;
-    const std::array viewport_list{
+    std::array viewport_list{
         GetViewportState(device, regs, 0, scale),  GetViewportState(device, regs, 1, scale),
         GetViewportState(device, regs, 2, scale),  GetViewportState(device, regs, 3, scale),
         GetViewportState(device, regs, 4, scale),  GetViewportState(device, regs, 5, scale),
@@ -3657,6 +4113,14 @@ void RasterizerVulkan::UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& reg
         GetViewportState(device, regs, 12, scale), GetViewportState(device, regs, 13, scale),
         GetViewportState(device, regs, 14, scale), GetViewportState(device, regs, 15, scale),
     };
+    if (jitter[0] != 0.0f || jitter[1] != 0.0f) {
+        // Shift the whole raster by a sub-pixel amount (scaled pixels when rescaling).
+        for (VkViewport& viewport : viewport_list) {
+            viewport.x += jitter[0];
+            viewport.y += jitter[1];
+        }
+        ++oot_jittered_updates;
+    }
     scheduler.Record([this, viewport_list](vk::CommandBuffer cmdbuf) {
         const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
         const vk::Span<VkViewport> viewports(viewport_list.data(), num_viewports);

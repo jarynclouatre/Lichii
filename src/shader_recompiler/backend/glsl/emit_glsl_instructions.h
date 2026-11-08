@@ -76,6 +76,8 @@ void EmitIsbeRead(EmitContext& ctx);
 void EmitIsbeWriteAttribute(EmitContext& ctx);
 void EmitIsbeWriteMapU8(EmitContext& ctx);
 void EmitIsbeWriteMapU32(EmitContext& ctx);
+void EmitOotPrevCbufU32(EmitContext& ctx);
+void EmitOotShadowWriteAttribute(EmitContext& ctx);
 void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, std::string_view value);
 void EmitSetSampleMask(EmitContext& ctx, std::string_view value);
 void EmitSetFragDepth(EmitContext& ctx, std::string_view value);

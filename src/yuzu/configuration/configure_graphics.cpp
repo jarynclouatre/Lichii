@@ -229,7 +229,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifndef EGLANTINE_STREAMLINE
         // Only builds with NVIDIA Streamline (Windows) can use it.
-        if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+        if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
+            setting->Id() == Settings::values.dlss_sharpening.Id() ||
+            setting->Id() == Settings::values.dlss_preset.Id()) {
             continue;
         }
 #endif
@@ -244,6 +246,10 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 return builder.BuildWidget(setting, apply_funcs,
                                            ConfigurationShared::RequestType::Slider, true, 1.0f,
                                            nullptr, tr(" Hz", "Frame rate limit (e.g. 120 Hz)"));
+            } else if (setting->Id() == Settings::values.dlss_sharpening.Id()) {
+                return builder.BuildWidget(setting, apply_funcs,
+                                           ConfigurationShared::RequestType::Slider, true, 1.0f,
+                                           nullptr, tr("%", "DLSS sharpening percentage (e.g. 50%)"));
             } else {
                 return builder.BuildWidget(setting, apply_funcs);
             }

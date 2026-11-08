@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 460
+
+// Ocarina of Time, DLSS after the tonemap: DLSS upscaled the tonemapped scene without the
+// particles (fireflies, dust, fairy glow). What they added to the tonemapped image goes on top of
+// its output, so they never enter its history.
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, rgba16f) uniform image2D dlss_output;
+// The game's tonemapped image with the particles, and the same drawn again without them, at the
+// render size.
+layout (binding = 1) uniform sampler2D with_particles;
+layout (binding = 2) uniform sampler2D without_particles;
+
+layout (push_constant) uniform PushConstants {
+    vec2 output_size;
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(output_size)))) {
+        return;
+    }
+    const vec2 uv = (vec2(pixel) + 0.5) / output_size;
+    const vec3 added = textureLod(with_particles, uv, 0.0).rgb -
+                       textureLod(without_particles, uv, 0.0).rgb;
+    const vec4 colour = imageLoad(dlss_output, pixel);
+    imageStore(dlss_output, pixel, vec4(max(colour.rgb + added, vec3(0.0)), colour.a));
+}

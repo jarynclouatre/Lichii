@@ -65,6 +65,7 @@ SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(DlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -411,6 +412,21 @@ struct Values {
                                                   false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    // AMD RCAS sharpening on NVIDIA DLSS's output (DLSS has none of its own since 3.1), in
+    // percent; 0 leaves it unsharpened. Not applied in DLAA.
+    SwitchableSetting<int, true> dlss_sharpening{linkage,
+                                                 0,
+                                                 0,
+                                                 100,
+                                                 "dlss_sharpening",
+                                                 Category::Renderer,
+                                                 Specialization::Scalar |
+                                                     Specialization::Percentage,
+                                                 true,
+                                                 true};
+    // NVIDIA DLSS's model; Auto lets the caller choose (preset K for Ocarina of Time).
+    SwitchableSetting<DlssPreset> dlss_preset{linkage, DlssPreset::Auto, "dlss_preset",
+                                              Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -427,7 +443,8 @@ struct Values {
                                                   true,
                                                   true};
     // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
-    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
+    // pass, the tonemapped image as the game renders it (video_core/oot_network.h), or NVIDIA
+    // DLSS (4K Quality) / DLAA (4K) in its place (video_core/oot_dlss.h).
     SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
                                                          "oot_anti_aliasing", Category::Renderer};
 

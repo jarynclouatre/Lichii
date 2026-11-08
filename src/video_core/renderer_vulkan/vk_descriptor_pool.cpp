@@ -53,6 +53,7 @@ static DescriptorBankInfo MakeBankInfo(std::span<const Shader::Info> infos) {
         bank.image_buffers += Accumulate(info.image_buffer_descriptors);
         bank.textures += Accumulate(info.texture_descriptors);
         bank.images += Accumulate(info.image_descriptors);
+        bank.storage_buffers += info.oot_motion.history || info.oot_motion.image ? 1 : 0;
     }
     bank.score = bank.uniform_buffers + bank.storage_buffers + bank.texture_buffers +
                  bank.image_buffers + bank.textures + bank.images;

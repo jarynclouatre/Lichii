@@ -166,22 +166,34 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
               "of the AMD FSR 1 and SGSR window adapting filters."));
+    INSERT(Settings, dlss_preset, tr("DLSS Preset:"),
+           tr("NVIDIA DLSS's model. Auto uses the game's choice (preset K for Ocarina of Time). "
+              "K: NVIDIA's default for Quality and DLAA. L: sharper, more stable, costlier. M: "
+              "like L, closer to K in cost.\nTakes effect when a game starts."));
+    INSERT(Settings, dlss_sharpening, tr("DLSS Sharpness:"),
+           tr("Sharpens NVIDIA DLSS's upscaled output with AMD FidelityFX RCAS (DLSS has had no "
+              "sharpening of its own since DLSS 3.1). Not applied in DLAA. 0% leaves it "
+              "unsharpened."));
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
               "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
               "download button below.\nFire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
-              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
+              "remains active.\nIn The Legend of Zelda: Ocarina of Time, pick NVIDIA DLSS or DLAA "
+              "under Ocarina of Time anti-aliasing.\nTakes effect when a game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
     INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
            tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
-              "without the network (faster; pairs well with a higher resolution). Has no effect while "
-              "NVIDIA DLSS is on.\nTakes effect when the game starts."));
+              "without the network (faster; pairs well with a higher resolution).\nNVIDIA DLSS (4K "
+              "Quality): NVIDIA DLSS in its place, upscaling the game's 2560x1440 to 3840x2160 with "
+              "sub-pixel jitter and motion vectors.\nNVIDIA DLAA (4K): the 3D renders at 3840x2160 "
+              "and DLSS only anti-aliases it. Sharper, but slower.\nBoth DLSS modes need \"Use "
+              "NVIDIA DLSS\" on and set the resolution scale to 1.5x for the game.\nTakes effect "
+              "when the game starts."));
     INSERT(Settings, post_shader_chain, QString(), QString());
     INSERT(Settings, post_shader_preset, QString(), QString());
     INSERT(Settings, post_shader_enabled, tr("Enable post-processing effects"),
@@ -609,10 +621,19 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(AntiAliasing, Fxaa, tr("FXAA")),
                               PAIR(AntiAliasing, Smaa, tr("SMAA")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::DlssPreset>::Index(),
+                          {
+                              PAIR(DlssPreset, Auto, tr("Auto")),
+                              PAIR(DlssPreset, K, tr("Preset K")),
+                              PAIR(DlssPreset, L, tr("Preset L")),
+                              PAIR(DlssPreset, M, tr("Preset M")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::OotAntiAliasing>::Index(),
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
+                              PAIR(OotAntiAliasing, NvidiaDlss, tr("NVIDIA DLSS (4K Quality)")),
+                              PAIR(OotAntiAliasing, NvidiaDlaa, tr("NVIDIA DLAA (4K)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

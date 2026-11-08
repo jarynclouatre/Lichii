@@ -33,6 +33,21 @@ constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescalin
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
 constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
 
+// Per-draw constants of Ocarina of Time's object motion, after the rescaling and render area words.
+struct OotMotionLayout {
+    u32 current_base;
+    u32 previous_base; // ~0 without history
+    u32 vertex_bias;
+    u32 vertex_range;
+    u32 instance_bias;
+    u32 flags; // bit 0: enabled for this draw
+    u32 image_width; // pixels per row of the motion buffer
+};
+constexpr u32 OOT_MOTION_OFFSET = 48;
+constexpr u32 OOT_MOTION_PUSH_END = 80;
+static_assert(OOT_MOTION_OFFSET >= sizeof(RescalingLayout) + sizeof(RenderAreaLayout));
+static_assert(OOT_MOTION_OFFSET + sizeof(OotMotionLayout) <= OOT_MOTION_PUSH_END);
+
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {
     Bindings binding;

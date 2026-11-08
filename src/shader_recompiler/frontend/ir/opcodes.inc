@@ -52,6 +52,8 @@ OPCODE(IsbeRead,                                            U32,            U32,
 OPCODE(IsbeWriteAttribute,                                  Void,           U32,            U32,                                                            )
 OPCODE(IsbeWriteMapU8,                                      Void,           U32,            U32,                                                            )
 OPCODE(IsbeWriteMapU32,                                     Void,           U32,            U32,                                                            )
+OPCODE(OotPrevCbufU32,                                      U32,            U32,            U32,                                                            )
+OPCODE(OotShadowWriteAttribute,                             Void,           U32,            U32,                                                            )
 OPCODE(SetFragColor,                                        Void,           U32,            U32,            F32,                                            )
 OPCODE(SetSampleMask,                                       Void,           U32,                                                                            )
 OPCODE(SetFragDepth,                                        Void,           F32,                                                                            )

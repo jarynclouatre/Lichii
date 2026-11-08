@@ -1,0 +1,185 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Motion vectors for Ocarina of Time's DLSS mode, in UV units, without the jitter.
+// Camera motion: each pixel's depth is unprojected with this frame's view-projection and
+// reprojected with the previous frame's (the game keeps both).
+// Object motion: the scene's fragment shaders keep the nearest fragment's motion and depth per
+// pixel (docs/nx2/oot-motion-vectors-plan.md); it replaces the camera motion where that depth is
+// the pixel's visible depth. The pass then clears it for the next frame.
+
+#version 460
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0) uniform sampler2D depth_texture;
+layout (binding = 1, rg16f) uniform writeonly image2D motion_vectors;
+// Two words per pixel: half2 motion, then the fragment depth's bits (all ones: no fragment).
+layout (binding = 2, std430) buffer ObjectMotion {
+    uint object_motion[];
+};
+layout (binding = 3, std430) buffer Stats {
+    // Scene pixels, pixels with a fragment write, pixels using it, and of those the ones within
+    // 1 pixel of the camera motion with the object y as is and negated; written fragments
+    // behind and in front of the scene depth.
+    // Then sums of |object x| and |camera x| in 1/16 pixels, and how often their x directions
+    // agree (where the camera moves over half a pixel), and how many such pixels.
+    uint stats[11];
+    // EDEN_OOT_MOTION_CHECK: |luminance error| sums (1/1024) of predicting this frame from last
+    // frame's colour with the motion as is, with y negated and with none, and their pixel count.
+    uint check[4];
+};
+
+// The half-resolution effects layer (fireflies, fairies, dust: no motion vectors) and DLSS's
+// bias-to-current-colour mask made from it.
+layout (binding = 4) uniform sampler2D effects_texture;
+layout (binding = 5, r16f) uniform writeonly image2D bias_mask;
+// The half-resolution volumetric fog layer: no motion of its own either.
+layout (binding = 6) uniform sampler2D fog_texture;
+// EDEN_OOT_MOTION_CHECK: this frame's colour, last frame's (kept by this pass), and where this
+// frame's goes for the next one.
+layout (binding = 7) uniform sampler2D current_color;
+layout (binding = 8) uniform sampler2D previous_color;
+layout (binding = 9, rgba16f) uniform writeonly image2D next_previous;
+
+layout (push_constant) uniform PushConstants {
+    // Row-major: previous clip = reproject * current NDC (with w = 1).
+    vec4 reproject_rows[4];
+    vec2 render_size;
+    // This frame's jitter in render pixels (the raster was shifted by it).
+    vec2 jitter;
+    // 1 when the image's first row is NDC y = +1 (the game's clip space points y up).
+    float flip_y;
+    // Bit 0: read object motion. Bit 1: count statistics. Bit 2: debug view (red: the motion
+    // length / 32 px; green: 0.6 where object motion is used, plus 0.3 where the depth is empty).
+    // Bit 3: effects_texture is bound (else the mask is 0).
+    uint object_flags;
+    // Effects layer brightness to mask value; bit 4 of the flags: fog_texture is bound.
+    float mask_gain;
+    // Fog layer luminance to mask value.
+    float fog_gain;
+    // Camera motion below this many render pixels per axis counts as none (see below).
+    float camera_deadzone;
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(render_size)))) {
+        return;
+    }
+    const vec2 uv = (vec2(pixel) + 0.5 - jitter) / render_size;
+    float mask = 0.0;
+    if ((object_flags & 8u) != 0u) {
+        const vec3 effects =
+            textureLod(effects_texture, (vec2(pixel) + 0.5) / render_size, 0.0).rgb;
+        // Only clearly bright effects: faint haze in the layer would leave whole areas trusting
+        // the current, jittered frame (the image then shakes).
+        mask = clamp((max(effects.r, max(effects.g, effects.b)) - 0.03) * mask_gain, 0.0, 1.0);
+    }
+    if ((object_flags & 16u) != 0u) {
+        const vec3 fog = textureLod(fog_texture, (vec2(pixel) + 0.5) / render_size, 0.0).rgb;
+        mask = max(mask, clamp(dot(fog, vec3(0.2126, 0.7152, 0.0722)) * fog_gain, 0.0, 1.0));
+    }
+    imageStore(bias_mask, pixel, vec4(mask));
+    const float depth = texelFetch(depth_texture, pixel, 0).r;
+    vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    if (flip_y > 0.5) {
+        ndc.y = -ndc.y;
+    }
+    const vec4 previous = vec4(dot(reproject_rows[0], ndc), dot(reproject_rows[1], ndc),
+                               dot(reproject_rows[2], ndc), dot(reproject_rows[3], ndc));
+    vec2 previous_ndc = previous.w > 1e-6 ? previous.xy / previous.w : ndc.xy;
+    if (flip_y > 0.5) {
+        previous_ndc.y = -previous_ndc.y;
+    }
+    const vec2 previous_uv = previous_ndc * 0.5 + 0.5;
+    vec2 motion = previous_uv - uv;
+    // A still camera's matrix changes by ~0.1 pixel a frame the scene does not show: as motion
+    // it nudged DLSS's history back and forth, and the whole image wavered up and down.
+    const vec2 camera_pixels = motion * render_size;
+    motion = mix(motion, vec2(0.0), lessThan(abs(camera_pixels), vec2(camera_deadzone)));
+    bool used_object = false;
+
+    if ((object_flags & 1u) != 0u) {
+        const uint word = 2u * (uint(pixel.y) * uint(render_size.x) + uint(pixel.x));
+        const uvec2 written = uvec2(object_motion[word], object_motion[word + 1u]);
+        const bool count = (object_flags & 2u) != 0u && depth < 1.0;
+        if (count) {
+            atomicAdd(stats[0], 1u);
+        }
+        if (written.y != 0xffffffffu) {
+            vec2 object = unpackHalf2x16(written.x);
+            if (flip_y > 0.5) {
+                object.y = -object.y;
+            }
+            const float written_depth = uintBitsToFloat(written.y);
+            const bool visible = depth < 1.0 && abs(written_depth - depth) <= 1e-6;
+            const bool plausible = all(lessThan(abs(object), vec2(0.25)));
+            if (count) {
+                atomicAdd(stats[1], 1u);
+                if (written_depth > depth + 1e-6) {
+                    atomicAdd(stats[5], 1u);
+                } else if (written_depth < depth - 1e-6) {
+                    atomicAdd(stats[6], 1u);
+                }
+            }
+            if (visible && plausible) {
+                if (count) {
+                    atomicAdd(stats[2], 1u);
+                    const vec2 tolerance = vec2(1.0) / render_size;
+                    if (all(lessThan(abs(object - motion), tolerance))) {
+                        atomicAdd(stats[3], 1u);
+                    }
+                    if (all(lessThan(abs(vec2(object.x, -object.y) - motion), tolerance))) {
+                        atomicAdd(stats[4], 1u);
+                    }
+                }
+                if (count) {
+                    const vec2 object_px = object * render_size;
+                    const vec2 camera_px = motion * render_size;
+                    atomicAdd(stats[7], uint(min(abs(object_px.x), 4096.0) * 16.0));
+                    atomicAdd(stats[8], uint(min(abs(camera_px.x), 4096.0) * 16.0));
+                    if (abs(camera_px.x) > 0.5) {
+                        atomicAdd(stats[10], 1u);
+                        if (object_px.x * camera_px.x > 0.0) {
+                            atomicAdd(stats[9], 1u);
+                        }
+                    }
+                }
+                motion = object;
+                used_object = true;
+            }
+            object_motion[word] = 0xffffffffu;
+            object_motion[word + 1u] = 0xffffffffu;
+        }
+    }
+    if ((object_flags & 4u) != 0u) {
+        imageStore(motion_vectors, pixel,
+                   vec4(length(motion * render_size) / 32.0,
+                        (used_object ? 0.6 : 0.0) + (depth >= 1.0 ? 0.3 : 0.0), 0.0, 0.0));
+        return;
+    }
+    imageStore(motion_vectors, pixel, vec4(motion, 0.0, 0.0));
+    // Bit 5: the motion check (bit 6: last frame's colour is valid).
+    if ((object_flags & 32u) != 0u) {
+        const vec3 here = texelFetch(current_color, pixel, 0).rgb;
+        imageStore(next_previous, pixel, vec4(here, 1.0));
+        const vec2 at = (vec2(pixel) + 0.5) / render_size;
+        if ((object_flags & 64u) != 0u && (pixel.x & 3) == 0 && (pixel.y & 3) == 0 &&
+            length(motion * render_size) > 1.0) {
+            const vec3 weights = vec3(0.2126, 0.7152, 0.0722);
+            const float lum = dot(here, weights);
+            const float as_is = abs(lum - dot(textureLod(previous_color, at + motion, 0.0).rgb,
+                                              weights));
+            const float flipped = abs(lum - dot(textureLod(previous_color,
+                                                           at + vec2(motion.x, -motion.y), 0.0)
+                                                    .rgb,
+                                                weights));
+            const float none = abs(lum - dot(textureLod(previous_color, at, 0.0).rgb, weights));
+            atomicAdd(check[0], uint(min(as_is, 4.0) * 1024.0));
+            atomicAdd(check[1], uint(min(flipped, 4.0) * 1024.0));
+            atomicAdd(check[2], uint(min(none, 4.0) * 1024.0));
+            atomicAdd(check[3], 1u);
+        }
+    }
+}

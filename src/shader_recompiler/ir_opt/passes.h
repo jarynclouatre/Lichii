@@ -39,6 +39,8 @@ void LayerPass(IR::Program& program, const HostTranslateInfo& host_info);
 void VendorWorkaroundPass(IR::Program& program);
 void VerificationPass(const IR::Program& program);
 bool HasBrokenPattern(const IR::Program& program);
+/// Ocarina of Time mesh object motion (oot_shadow_pass.cpp). False when nothing changed.
+bool OotShadowPass(IR::Program& program);
 
 // Dual Vertex
 void VertexATransformPass(IR::Program& program);

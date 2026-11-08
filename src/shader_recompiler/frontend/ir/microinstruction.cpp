@@ -86,6 +86,7 @@ bool Inst::MayHaveSideEffects() const noexcept {
     case Opcode::IsbeWriteAttribute:
     case Opcode::IsbeWriteMapU8:
     case Opcode::IsbeWriteMapU32:
+    case Opcode::OotShadowWriteAttribute:
     case Opcode::SetFragColor:
     case Opcode::SetSampleMask:
     case Opcode::SetFragDepth:

@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#include "video_core/renderer_vulkan/vk_oot_motion_vectors.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
@@ -150,6 +151,18 @@ public:
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history);
 
+    /// Ocarina of Time DLSS mode: NVIDIA DLSS on the tonemapped colour with motion vectors
+    /// rebuilt from depth (`reproject`: previous clip from current NDC, row-major) and this
+    /// frame's viewport jitter. False when DLSS can't run (the caller copies the colour instead).
+    bool OotDlss(Framebuffer* dst_framebuffer, ImageView& input_color, ImageView& depth,
+                 std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                 const std::array<f32, 16>& reproject, bool flip_y, bool reset,
+                 bool hdr = false, ImageView* effects = nullptr, ImageView* fog = nullptr);
+
+    /// Copies an image into a particle copy, or back (OotMotionVectors::SnapshotScene).
+    void OotSnapshotScene(VkImage image, VideoCore::Surface::PixelFormat format,
+                          std::array<u32, 2> size, u32 which, bool restore);
+
     /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
@@ -276,6 +289,7 @@ public:
                          std::array<f32, 2> motion_scale, bool reset);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+    std::unique_ptr<OotMotionVectors> oot_motion_vectors;
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next

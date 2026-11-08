@@ -170,6 +170,48 @@ public:
         return fragment_has_color0_output;
     }
 
+    /// Ocarina of Time object motion: the vertex stage keeps history (vk_oot_object_motion.h).
+    [[nodiscard]] bool UsesOotMotion() const noexcept {
+        return std::ranges::any_of(stage_infos,
+                                   [](const auto& info) { return info.oot_motion.history; });
+    }
+
+    /// Words of last frame's constant buffers the mesh stage's shadow evaluation reads (OoT
+    /// object motion, OotShadowPass), else 0.
+    [[nodiscard]] u32 OotMeshShadowWords() const noexcept {
+        for (const auto& info : stage_infos) {
+            if (info.oot_motion.history && info.oot_motion.shadow) {
+                return info.oot_motion.shadow_words;
+            }
+        }
+        return 0;
+    }
+
+    /// The mesh stage's vertices per workgroup when it keeps OoT object motion history, else 0.
+    [[nodiscard]] u32 OotMeshMaxVertices() const noexcept {
+        for (const auto& info : stage_infos) {
+            if (info.oot_motion.history) {
+                return info.oot_motion.mesh_max_vertices;
+            }
+        }
+        return 0;
+    }
+
+    /// The stages the pipeline layout's push constant range covers.
+    [[nodiscard]] VkShaderStageFlags PushConstantStages() const noexcept {
+        return IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                      VK_SHADER_STAGE_MESH_BIT_EXT
+                                : VK_SHADER_STAGE_ALL_GRAPHICS;
+    }
+
+    [[nodiscard]] VkPipelineLayout PipelineLayout() const noexcept {
+        return *pipeline_layout;
+    }
+
+    bool FragmentCanDiscard() const noexcept {
+        return stage_infos[NUM_STAGES - 1].uses_demote_to_helper_invocation;
+    }
+
     /// Color components of a render target the fragment shader writes, as VkColorComponentFlags
     VkColorComponentFlags ColorOutputMask(size_t render_target) const noexcept {
         return (color_output_mask >> (render_target * 4)) & 0xF;
