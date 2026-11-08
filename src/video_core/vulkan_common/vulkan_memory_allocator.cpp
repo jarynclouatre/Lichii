@@ -244,6 +244,18 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
+    // An image of the same create info released before is taken from the recycler instead
+    // (vk::ImageRecycler).
+    const u64 recycle_key = vk::ImageRecycler::KeyOf(ci, dedicated);
+    if (recycle_key != 0 && vk::ImageRecycler::Take(recycle_key, allocator, handle, allocation)) {
+        image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                          device.GetDispatchLoader());
+        image.SetRecycleKey(recycle_key);
+        return VK_SUCCESS;
+    }
+    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
+    // backed: VMA would quietly place them in system memory once VRAM is full. They take the
+    // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -323,6 +335,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
 
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
+    // Images placed in host memory under memory pressure are freed rather than kept.
+    if (recycle_key != 0 && alloc_info.memoryType < properties.memoryTypeCount &&
+        (properties.memoryTypes[alloc_info.memoryType].propertyFlags &
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+        image.SetRecycleKey(recycle_key);
+    }
     return VK_SUCCESS;
 }
 

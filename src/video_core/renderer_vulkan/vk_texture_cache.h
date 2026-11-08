@@ -101,6 +101,11 @@ public:
 
     u64 GetDeviceMemoryUsage() const;
 
+    /// Device memory the image recycler keeps (vk::ImageRecycler): the collector counts it as
+    /// free, and when memory runs short the recycler gives it back first.
+    u64 GetRecycledImageMemory() const;
+    void ShrinkRecycledImages(u64 bytes);
+
     /// GPU progress: the texture cache frees a deleted image once the GPU is past its last use.
     [[nodiscard]] u64 CurrentTick() const noexcept;
 
