@@ -113,6 +113,7 @@ void BufferCache<P>::TickFrame() {
     }
     runtime.TickFrame(slot_buffers);
     native_indirect_uniforms_this_frame.clear();
+    native_indirect_uniform_ranges_this_frame.Clear();
     if (const GeometryStats& stats = geometry_stats; frame_tick % 600 == 0 && stats.syncs != 0) {
         if (Nx2Profile::Enabled() || Nx2Perf::Verify()) {
             LOG_INFO(HW_GPU,
@@ -1476,11 +1477,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // Banks are keyed by the bytes they cover, not their start address: Ocarina of Time binds
+    // thousands of overlapping 64 KiB windows a frame (one per draw in Hyrule Castle Town), and
+    // uploading each window whole copied ~64 KiB per draw, which left the GPU thread at 2 fps.
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
-        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
-        native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        native_indirect_uniforms_this_frame.insert(device_addr);
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
@@ -1489,12 +1493,40 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         const u64 upload_size = (std::min<u64>)(mapped_size, size);
         if (upload_size != 0) {
-            std::array<BufferCopy, 1> copies{BufferCopy{
-                .src_offset = 0,
-                .dst_offset = buffer.Offset(device_addr),
-                .size = upload_size,
-            }};
-            UploadMemory(buffer, upload_size, upload_size, copies);
+            if (Nx2Perf::Verify()) {
+                native_indirect_uniform_ranges_this_frame.Subtract(device_addr, upload_size);
+            }
+            // Upload only the parts no other bank uploaded this frame.
+            boost::container::small_vector<BufferCopy, 4> copies;
+            u64 total_size = 0;
+            u64 largest_copy = 0;
+            const auto add_copy = [&](DAddr begin, DAddr end) {
+                const u64 copy_size = end - begin;
+                copies.push_back(BufferCopy{
+                    .src_offset = total_size,
+                    .dst_offset = buffer.Offset(begin),
+                    .size = copy_size,
+                });
+                total_size += copy_size;
+                largest_copy = (std::max)(largest_copy, copy_size);
+            };
+            DAddr cursor = device_addr;
+            const DAddr upload_end = device_addr + upload_size;
+            native_indirect_uniform_ranges_this_frame.ForEachInRange(
+                device_addr, upload_size, [&](DAddr covered_begin, DAddr covered_end) {
+                    if (covered_begin > cursor) {
+                        add_copy(cursor, covered_begin);
+                    }
+                    cursor = (std::max)(cursor, covered_end);
+                });
+            if (cursor < upload_end) {
+                add_copy(cursor, upload_end);
+            }
+            if (!copies.empty()) {
+                native_indirect_uniform_ranges_this_frame.Add(device_addr, upload_size);
+                UploadMemory(buffer, total_size, largest_copy,
+                             std::span<BufferCopy>(copies.data(), copies.size()));
+            }
         }
     }
     const bool use_fast_buffer = needs_alignment_stream

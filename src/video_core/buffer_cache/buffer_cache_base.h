@@ -487,6 +487,7 @@ public:
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    Common::RangeSet<DAddr> native_indirect_uniform_ranges_this_frame;
 
 private:
     template <typename Mask, typename Func>
