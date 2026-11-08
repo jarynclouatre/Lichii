@@ -546,7 +546,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     std::vector<MeshProgram> mesh_programs;
     std::vector<MeshSet> mesh_sets;
     std::set<std::tuple<size_t, size_t, size_t, std::array<u32, 3>>> mesh_set_keys;
-    // The current BNSH variation's fragment and task programs (a mesh program comes last).
+    // The current variation's fragment and task programs (a mesh program comes last).
     std::optional<ShaderRecord> variation_fragment;
     std::optional<ShaderRecord> variation_task;
     size_t archive_errors = 0;

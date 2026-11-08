@@ -43,8 +43,8 @@ struct ShaderRecord {
     ProgramStage stage{};
     std::span<const u8> code;
     std::span<const u8> control;
-    /// First program of a BNSH variation, or a program outside one. The programs of one variation
-    /// (stage order: vertex to fragment, compute, task, mesh) are drawn together.
+    /// First program of a BNSH variation or BAHS program, or a program outside one. The programs
+    /// of one variation (stage order: vertex to fragment, compute, task, mesh) are drawn together.
     bool new_variation = true;
 };
 
