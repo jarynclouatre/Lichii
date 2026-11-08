@@ -1233,8 +1233,12 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             // it is done the old translation runs rather than the game stopping for it. Only one
             // that stores nothing through global memory: its router could send a store through a
             // new pointer into the nearest bound buffer below it.
+            LOG_INFO(Render_Vulkan, "Nx2Perf compute null slot: {:016x} rebuilt in the "
+                     "background", key.unique_hash);
             entry.rebuild = std::make_unique<ComputePipelineCacheEntry>(std::move(rebuilt));
         } else if (rebuilt.pipeline) {
+            LOG_INFO(Render_Vulkan, "Nx2Perf compute null slot: {:016x} rebuilt in place (old "
+                     "translation stores through global memory)", key.unique_hash);
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(entry.pipeline));
