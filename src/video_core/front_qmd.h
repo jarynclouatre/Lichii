@@ -572,10 +572,11 @@ private:
             split.NoteSemaphoreWrite(*device, value, base.has_value());
             check(*device, value, base.has_value(), false);
         } else if (four_words) {
-            // The payload as 64 bits, a timestamp after it. Fence-flagged reports, like the plain
-            // release below: they land once their fence ran.
-            split.NoteSemaphoreWrite(*device, payload, true, false, GpuSplit::Landing::Fenced);
-            split.NoteSemaphoreWrite(*device + 4, 0, true, false, GpuSplit::Landing::Fenced);
+            // The payload as 64 bits, a timestamp after it. Fence-flagged payload reports, like the
+            // plain release below.
+            split.NoteSemaphoreWrite(*device, payload, true, false,
+                                     GpuSplit::FencedPayloadLanding());
+            split.NoteSemaphoreWrite(*device + 4, 0, true, false, GpuSplit::FencedPayloadLanding());
             check(*device, payload, true, false);
             check(*device + 4, 0, true, false);
         } else if (maximum) {
@@ -584,7 +585,8 @@ private:
             split.NoteSemaphoreWrite(*device, value, true, !base.has_value());
             check(*device, value, true, !base.has_value());
         } else {
-            split.NoteSemaphoreWrite(*device, payload, true, false, GpuSplit::Landing::Fenced);
+            split.NoteSemaphoreWrite(*device, payload, true, false,
+                                     GpuSplit::FencedPayloadLanding());
             check(*device, payload, true, false);
         }
     }

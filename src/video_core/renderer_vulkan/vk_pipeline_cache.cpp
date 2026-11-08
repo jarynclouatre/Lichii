@@ -284,7 +284,8 @@ ShaderTranslationKey MakeShaderTranslationKey(const GraphicsPipelineCacheKey& pi
             const char* value = std::getenv("EDEN_OOT_MESH_MOTION");
             return value != nullptr ? value[0] : 's';
         }();
-        key.oot_mesh_motion = mesh_motion == 's' || mesh_motion == 'h' ? mesh_motion : 0;
+        key.oot_mesh_motion =
+            static_cast<u8>(mesh_motion == 's' || mesh_motion == 'h' ? mesh_motion : 0);
     }
 
     if (state.dynamic_vertex_input) {
