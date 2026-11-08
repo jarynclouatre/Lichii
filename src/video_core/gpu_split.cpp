@@ -300,6 +300,14 @@ bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
     return WaitFor(std::min({last_writer_position, last_sync_position, write_position}), site);
 }
 
+GpuSplit::Landing GpuSplit::FencedPayloadLanding() {
+    const bool synced = Settings::IsGPUFenceBehaviorDefault()
+                            ? !Settings::IsGPULevelHigh()
+                            : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                  !Settings::IsGPUFenceBehaviorAccurate();
+    return synced ? Landing::AtRun : Landing::Fenced;
+}
+
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least,
                                   Landing landing) {
     if (semaphore_writes.size() >= semaphore_writes_limit) {

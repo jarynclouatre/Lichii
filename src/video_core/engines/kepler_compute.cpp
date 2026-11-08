@@ -2157,11 +2157,11 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
                                  base.has_value());
         return;
     }
-    // One word: a fence-flagged report, which lands once its fence ran. Else a payload report
-    // with a timestamp, written as the back runs it.
+    // One word: a fence-flagged report. Else a payload report with a timestamp, written as the
+    // back runs it.
     const bool one_word = ((control >> 28) & 1) != 0;
-    const auto landing =
-        one_word ? VideoCommon::GpuSplit::Landing::Fenced : VideoCommon::GpuSplit::Landing::AtRun;
+    const auto landing = one_word ? VideoCommon::GpuSplit::FencedPayloadLanding()
+                                  : VideoCommon::GpuSplit::Landing::AtRun;
     split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], true, false, landing);
     if (!one_word) {
         // 64 bits (a timestamp follows).

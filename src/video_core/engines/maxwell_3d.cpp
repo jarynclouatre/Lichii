@@ -1611,8 +1611,9 @@ void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& 
     // back runs it, a short release (fence-flagged) or a counter once a fence ran.
     const bool fence_flagged = operation == Regs::ReportSemaphore::Operation::Release &&
                                report.query.short_query != 0;
-    const auto landing = payload && !fence_flagged ? VideoCommon::GpuSplit::Landing::AtRun
-                                                   : VideoCommon::GpuSplit::Landing::Fenced;
+    const auto landing = !payload        ? VideoCommon::GpuSplit::Landing::Fenced
+                         : fence_flagged ? VideoCommon::GpuSplit::FencedPayloadLanding()
+                                         : VideoCommon::GpuSplit::Landing::AtRun;
     split.NoteSemaphoreWrite(*device, report.payload, payload, false, landing);
     VideoCommon::Nx2AcquireStats::NoteRelease(*device,
                                               VideoCommon::Nx2AcquireStats::Releaser::Report3D);

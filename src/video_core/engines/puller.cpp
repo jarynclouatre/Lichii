@@ -96,9 +96,8 @@ void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
         return;
     }
     const bool four_words = True(properties & VideoCommon::QueryPropertiesFlags::HasTimeout);
-    // A fence-flagged report lands once the fence after it ran (QueryCacheBase::CounterReport).
     const auto landing = True(properties & VideoCommon::QueryPropertiesFlags::IsAFence)
-                             ? VideoCommon::GpuSplit::Landing::Fenced
+                             ? VideoCommon::GpuSplit::FencedPayloadLanding()
                              : VideoCommon::GpuSplit::Landing::AtRun;
     split.NoteWrite(dma_pusher.memory_manager, address, four_words ? 16 : sizeof(u32));
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
