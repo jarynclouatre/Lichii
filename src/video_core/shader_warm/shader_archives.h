@@ -47,6 +47,8 @@ struct ShaderRecord {
     /// The program's constant table (driver bank 1), empty when it has none: control word 60 is
     /// its size and word 64 its offset from the start of the program allocation.
     std::span<const u8> constants;
+    /// First program of a BNSH variation or BAHS program, or a program outside one. The programs
+    /// of one variation (stage order: vertex to fragment, compute, task, mesh) are drawn together.
     bool new_variation = true;
 };
 

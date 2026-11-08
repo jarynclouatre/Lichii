@@ -686,6 +686,9 @@ std::vector<Record> ParseBahs(Bytes data) {
     };
     std::vector<Record> records;
     u64 cursor = table + 8;
+    // A program's records are consecutive, in slot order: a slot not after the previous record's
+    // starts the next program.
+    u32 previous_slot = 0;
     for (u64 index = 0; index < count; ++index) {
         if (cursor + 32 > end) {
             throw ArchiveError("truncated BAHS record header");
@@ -704,6 +707,8 @@ std::vector<Record> ParseBahs(Bytes data) {
         if (!info) {
             throw ArchiveError(fmt::format("unsupported BAHS shader slot {}", slot));
         }
+        const bool new_variation = index == 0 || slot <= previous_slot;
+        previous_slot = slot;
         // A shared control can be referenced backwards from a later descriptor.
         const s64 control_offset = static_cast<s64>(descriptor) + control_relative;
         if (control_size < 104 || control_offset < static_cast<s64>(table + 8) ||
@@ -743,15 +748,16 @@ std::vector<Record> ParseBahs(Bytes data) {
             if (code.size() <= 128 || (code.size() - 128) % 16 || !header_ok) {
                 throw ArchiveError("invalid BAHS task/mesh graphics envelope");
             }
-            records.push_back({info->stage, code, control, constants});
+            records.push_back({info->stage, code, control, constants, new_variation});
         } else if (info->stage == ProgramStage::Compute) {
-            records.push_back({info->stage, code, control, constants});
+            records.push_back({info->stage, code, control, constants, new_variation});
         } else {
             auto item = GraphicsRecord(code, control);
             if (item.stage != info->stage) {
                 throw ArchiveError("BAHS record disagrees with the graphics header stage");
             }
             item.constants = constants;
+            item.new_variation = new_variation;
             records.push_back(item);
         }
         cursor += length;
