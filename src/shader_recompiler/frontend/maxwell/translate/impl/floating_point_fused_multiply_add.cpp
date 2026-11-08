@@ -28,9 +28,9 @@ void FFMA(TranslatorVisitor& v, u64 insn, const IR::F32& src_b, const IR::F32& s
         .fmz_mode = CastFmzMode(fmz_mode),
     };
     IR::F32 value{v.ir.FPFma(op_a, op_b, op_c, fp_control)};
-    if (fmz_mode == FmzMode::FMZ && !sat) {
-        // Do not implement FMZ if SAT is enabled, as it does the logic for us.
-        // On D3D9 mode, anything * 0 is zero, even NAN and infinity
+    if (fmz_mode == FmzMode::FMZ) {
+        // On D3D9 mode, anything * 0 is zero, even NAN and infinity, so the result is the addend.
+        // SAT doesn't make this redundant: it turns the NaN of 0 * Inf + c into 0, not sat(c).
         const IR::F32 zero{v.ir.Imm32(0.0f)};
         const IR::U1 zero_a{v.ir.FPEqual(op_a, zero)};
         const IR::U1 zero_b{v.ir.FPEqual(op_b, zero)};

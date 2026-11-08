@@ -58,6 +58,7 @@ add_executable(tests
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
     video_core/blit_dither.cpp
+    video_core/maxwell_fmz.cpp
     video_core/maxwell_numeric.cpp
     video_core/maxwell_permute_lod.cpp
     video_core/submission_policy.cpp

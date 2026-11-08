@@ -44,15 +44,8 @@ void HMUL2(TranslatorVisitor& v, u64 insn, Merge merge, bool sat, bool abs_a, bo
         // Do not implement FMZ if SAT is enabled, as it does the logic for us.
         // On D3D9 mode, anything * 0 is zero, even NAN and infinity
         const IR::F32 zero{v.ir.Imm32(0.0f)};
-        const IR::U1 lhs_zero_a{v.ir.FPEqual(lhs_a, zero)};
-        const IR::U1 lhs_zero_b{v.ir.FPEqual(lhs_b, zero)};
-        const IR::U1 lhs_any_zero{v.ir.LogicalOr(lhs_zero_a, lhs_zero_b)};
-        lhs = IR::F16F32F64{v.ir.Select(lhs_any_zero, zero, lhs)};
-
-        const IR::U1 rhs_zero_a{v.ir.FPEqual(rhs_a, zero)};
-        const IR::U1 rhs_zero_b{v.ir.FPEqual(rhs_b, zero)};
-        const IR::U1 rhs_any_zero{v.ir.LogicalOr(rhs_zero_a, rhs_zero_b)};
-        rhs = IR::F16F32F64{v.ir.Select(rhs_any_zero, zero, rhs)};
+        lhs = SelectFmzProduct(v.ir, lhs_a, lhs_b, zero, lhs);
+        rhs = SelectFmzProduct(v.ir, rhs_a, rhs_b, zero, rhs);
     }
     if (sat) {
         lhs = v.ir.FPSaturate(lhs);

@@ -31,6 +31,12 @@ enum class HalfPrecision : u64 {
 
 IR::FmzMode HalfPrecision2FmzMode(HalfPrecision precision);
 
+/// FMZ: a product with a zero factor is zero, even when the other factor is Inf or NaN. Returns
+/// if_zero where a or b is zero and value elsewhere, with the type of value. F16 values are
+/// compared and selected as F32, which is exact both ways: the IR has no F16 select.
+IR::F16F32F64 SelectFmzProduct(IR::IREmitter& ir, const IR::F16F32F64& a, const IR::F16F32F64& b,
+                               const IR::F16F32F64& if_zero, const IR::F16F32F64& value);
+
 std::pair<IR::F16F32F64, IR::F16F32F64> Extract(IR::IREmitter& ir, IR::U32 value, Swizzle swizzle);
 
 IR::U32 MergeResult(IR::IREmitter& ir, IR::Reg dest, const IR::F16& lhs, const IR::F16& rhs,
