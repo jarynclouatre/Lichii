@@ -1203,13 +1203,38 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             }
             entry = CreateComputePipeline(key, shader);
         }
+    } else if (entry.rebuild) {
+        if (entry.rebuild->pipeline->IsBuildTaskDone()) {
+            if (entry.rebuild->pipeline->IsBound()) {
+                if (entry.pipeline) {
+                    retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                           std::move(entry.pipeline));
+                }
+                auto rebuilt{std::move(*entry.rebuild)};
+                rebuilt.rebuilds = entry.rebuilds + 1;
+                entry = std::move(rebuilt);
+            } else {
+                LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: the driver refused "
+                            "its rebuild", key.unique_hash);
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(entry.rebuild->pipeline));
+                entry.rebuild.reset();
+                entry.rebuilds = MaxComputeRebuilds;
+            }
+        }
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
         // The translation dropped accesses through a pointer that was null back then. Which slots
         // the game fills depends on the area, so the new one keeps binding every pointer this one
         // binds, null now or not: a null pointer binds nothing.
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
-        if (rebuilt.pipeline) {
+        if (rebuilt.pipeline && entry.pipeline && !entry.pipeline->StoresGlobalMemory()) {
+            // The driver build takes up to a second (Ocarina's foliage culling: 0.8-1.5 s). Until
+            // it is done the old translation runs rather than the game stopping for it. Only one
+            // that stores nothing through global memory: its router could send a store through a
+            // new pointer into the nearest bound buffer below it.
+            entry.rebuild = std::make_unique<ComputePipelineCacheEntry>(std::move(rebuilt));
+        } else if (rebuilt.pipeline) {
             if (entry.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(entry.pipeline));

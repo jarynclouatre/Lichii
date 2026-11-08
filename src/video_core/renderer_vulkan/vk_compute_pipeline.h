@@ -70,6 +70,12 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    /// Whether stores are left to the global memory functions, which route them to the nearest
+    /// bound buffer below their address
+    [[nodiscard]] bool StoresGlobalMemory() const noexcept {
+        return info.stores_global_memory;
+    }
+
     [[nodiscard]] u64 ShaderHash() const noexcept {
         return shader_hash;
     }

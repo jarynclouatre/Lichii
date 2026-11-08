@@ -124,6 +124,8 @@ struct ComputePipelineCacheEntry {
     /// checks (FileEnvironment::CheckDispatch) before the pipeline is kept and cached.
     std::unique_ptr<VideoCommon::FileEnvironment> prebuilt;
     u32 rebuilds{};
+    /// A rebuild still being built by a worker; dispatches keep using `pipeline` until it is done.
+    std::unique_ptr<ComputePipelineCacheEntry> rebuild;
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
