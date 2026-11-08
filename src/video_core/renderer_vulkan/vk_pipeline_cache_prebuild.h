@@ -83,8 +83,10 @@ public:
         started = true;
         workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
                                                Common::ThreadPlacement::Background));
-        for (auto& task : tasks) {
-            workers->QueueWork(std::move(task));
+        // Newest first: the cache file appends, so its end holds what the latest sessions found,
+        // which the game is likelier to need soon than its oldest records.
+        for (auto it = tasks.rbegin(); it != tasks.rend(); ++it) {
+            workers->QueueWork(std::move(*it));
         }
         tasks.clear();
     }

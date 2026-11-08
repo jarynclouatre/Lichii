@@ -213,14 +213,15 @@ TEST_CASE("Cached pipeline prebuild adopts a ready pipeline once without queuing
     std::promise<void> entered, release;
     auto gate = release.get_future().share();
     std::atomic<int> builds{};
-    REQUIRE(cache.Add(1, 1, [&] {
-        ++builds;
-        return std::make_unique<int>(42);
-    }));
+    // Added first: the prebuild runs newest first, so key 1 is built before this one blocks.
     REQUIRE(cache.Add(2, 1, [&] {
         entered.set_value();
         gate.wait();
         return std::make_unique<int>(7);
+    }));
+    REQUIRE(cache.Add(1, 1, [&] {
+        ++builds;
+        return std::make_unique<int>(42);
     }));
     cache.Start(1);
     entered.get_future().wait();
@@ -242,15 +243,16 @@ TEST_CASE("Draws claim pending prebuilds without waiting for a worker or its bud
     std::promise<void> entered, release;
     auto gate = release.get_future().share();
     std::atomic<int> builds{};
+    // Added last: the prebuild runs newest first, so this build holds the only worker.
+    REQUIRE(cache.Add(2, 1, [&] {
+        ++builds;
+        return std::make_unique<int>(7);
+    }));
     REQUIRE(cache.Add(1, 1, [&] {
         entered.set_value();
         gate.wait();
         ++builds;
         return std::make_unique<int>(42);
-    }));
-    REQUIRE(cache.Add(2, 1, [&] {
-        ++builds;
-        return std::make_unique<int>(7);
     }));
     cache.Start(1);
     entered.get_future().wait();
@@ -274,6 +276,12 @@ TEST_CASE("Cached pipeline failures release owned inputs and allow normal draw f
         std::weak_ptr<int> weak = input;
         std::promise<void> entered, release;
         auto gate = release.get_future().share();
+        // Added first: the prebuild runs newest first, so key 1 runs before this one blocks.
+        REQUIRE(cache.Add(2, 1, [&] {
+            entered.set_value();
+            gate.wait();
+            return std::make_unique<int>(7);
+        }));
         REQUIRE(cache.Add(1, 1, [input = std::move(input), failure]() -> std::unique_ptr<int> {
             if (failure == 0) {
                 throw std::runtime_error("cached translation failed");
@@ -284,11 +292,6 @@ TEST_CASE("Cached pipeline failures release owned inputs and allow normal draw f
             PipelineBuild driver{nullptr,
                                  [] { throw std::runtime_error("driver compile failed"); }};
             return driver.Failed() ? nullptr : std::make_unique<int>(42);
-        }));
-        REQUIRE(cache.Add(2, 1, [&] {
-            entered.set_value();
-            gate.wait();
-            return std::make_unique<int>(7);
         }));
         cache.Start(1);
         entered.get_future().wait();
@@ -307,16 +310,17 @@ TEST_CASE("Prebuild cancellation joins active work before destroying external re
     auto cache = std::make_unique<Vulkan::PipelinePrebuild<int, int>>(2, 100, false);
     std::promise<void> entered, release;
     auto gate = release.get_future().share();
+    auto queued_input = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = queued_input;
+    REQUIRE(cache->Add(
+        2, 1, [input = std::move(queued_input)] { return std::make_unique<int>(*input); }));
+    // Added last: the prebuild runs newest first, so key 2 is still queued when this blocks.
     REQUIRE(cache->Add(1, 1, [&, output = resource.get()] {
         entered.set_value();
         gate.wait();
         *output = 42;
         return std::make_unique<int>(7);
     }));
-    auto queued_input = std::make_shared<int>(42);
-    std::weak_ptr<int> weak = queued_input;
-    REQUIRE(cache->Add(
-        2, 1, [input = std::move(queued_input)] { return std::make_unique<int>(*input); }));
     cache->Start(1);
     entered.get_future().wait();
     auto destroy = std::async(std::launch::async, [&] { cache.reset(); });
