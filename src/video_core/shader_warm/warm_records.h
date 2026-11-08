@@ -84,11 +84,17 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control);
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
                              std::span<const u8> constants, ComputeKey& key);
 
-/// Env record of a single-stage graphics entry (stage 0 vertex or 4 fragment), without the
-/// leading env count and the key. `program` is the extracted allocation (header + code).
+/// Env record of a graphics stage (0 vertex, 4 fragment, 7 task, 8 mesh), without the leading
+/// env count and the key; task and mesh records still need the mesh state tail. `program` is the
+/// extracted allocation (header + code).
 /// `constants` is the program's constant table (ShaderRecord::constants), recorded as bank 1.
 std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<const u8> program,
                             std::span<const u8> constants);
+
+std::optional<std::array<u32, 3>> ReadMeshRegisters(std::span<const u8> mesh,
+                                                    std::span<const u8> task);
+
+u64 MeshStateHash(const std::array<u32, 3>& registers);
 
 /// The key of a graphics entry: `template_key` with this stage's hash slot (vertex 1,
 /// fragment 5) and, for vertex, the attribute types.
@@ -97,10 +103,10 @@ GraphicsKey GraphicsEntryKey(u32 stage, const GraphicsKey& template_key, u64 sta
 
 /// Draw state statistics from runtime pipeline caches recorded by the game.
 struct RuntimeStats {
-    /// Draw state per stage (index 0 vertex, 1 fragment), hash slots zeroed: among the records
-    /// with the most common render target (samples, depth, color formats), the most common
-    /// FixedPipelineState. Empty when the caches have no record of that stage.
-    std::array<std::optional<GraphicsKey>, 2> templates;
+    /// Draw state per stage (index 0 vertex, 1 fragment, 2 mesh), hash slots zeroed: among the
+    /// records with the most common render target (samples, depth, color formats), the most
+    /// common FixedPipelineState. Empty when the caches have no record of that stage.
+    std::array<std::optional<GraphicsKey>, 3> templates;
     /// Vertex stage hash -> attribute types (key bytes 112-119) of each unique occurrence.
     std::unordered_map<u64, std::vector<u64>> vertex_attributes;
     size_t occurrences{};

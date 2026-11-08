@@ -219,7 +219,7 @@ std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<con
                             std::span<const u8> constants) {
     const auto sph = program.first(80);
     const u32 bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer
-                                                     : (stage == 0 ? 0U : 2U);
+                                                     : (stage == 4 ? 2U : 0U);
     const size_t cbuf_count = constants.size() / 4;
     const u32 w1 = Get<u32>(sph, 4), w2 = Get<u32>(sph, 8), w3 = Get<u32>(sph, 12);
     const u64 local_memory =
@@ -232,6 +232,30 @@ std::vector<u8> GraphicsEnv(u32 stage, const LoweredCode& lowered, std::span<con
     PutConstantTable(out, constants);
     PutBytes(out, sph);
     return out;
+}
+
+std::optional<std::array<u32, 3>> ReadMeshRegisters(std::span<const u8> mesh,
+                                                    std::span<const u8> task) {
+    if (mesh.size() < 100 || (!task.empty() && task.size() < 92)) {
+        return std::nullopt;
+    }
+    if (Get<u8>(mesh, 95) != 3) {
+        return std::nullopt;
+    }
+    const u32 vertices = Get<u16>(mesh, 96);
+    const u32 primitives = Get<u16>(mesh, 98);
+    const u32 threads = Get<u16>(mesh, 88);
+    u32 init = 0;
+    if (!task.empty()) {
+        const u32 lines = Get<u16>(task, 90) / 128;
+        init = Get<u16>(task, 88) | (lines << 12) | (lines << 22);
+    }
+    return std::array<u32, 3>{4 | (vertices << 4) | (primitives << 13), threads << 20, init};
+}
+
+u64 MeshStateHash(const std::array<u32, 3>& registers) {
+    std::array<u32, 3 + 20> state{registers[0], registers[1], registers[2]};
+    return Common::CityHash64(reinterpret_cast<const char*>(state.data()), sizeof(state)) | 1;
 }
 
 GraphicsKey GraphicsEntryKey(u32 stage, const GraphicsKey& template_key, u64 stage_hash,
@@ -320,7 +344,7 @@ RuntimeStats ReadRuntimeStats(const std::vector<std::filesystem::path>& caches) 
                     continue;
                 }
                 const Env& env = envs[env_index++];
-                if (env.stage != 0 && env.stage != 4) {
+                if (env.stage != 0 && env.stage != 4 && env.stage != 8) {
                     continue;
                 }
                 const PairHash id{Hash128(bytes.subspan(env.begin, env.end - env.begin)),
@@ -362,8 +386,9 @@ RuntimeStats ReadRuntimeStats(const std::vector<std::filesystem::path>& caches) 
                   normalized.begin() + AttributeTypesOffset + 8, u8{0});
         return Hash128(normalized);
     };
-    for (size_t index = 0; index < 2; ++index) {
-        const u32 stage = index == 0 ? 0 : 4;
+    for (size_t index = 0; index < 3; ++index) {
+        constexpr std::array<u32, 3> stages{0, 4, 8};
+        const u32 stage = stages[index];
         // Counter.most_common over the records of this stage that `keep` accepts: index of the
         // first record of the group with the highest count, the first seen among equals.
         const auto most_common = [&](const auto& group_of,

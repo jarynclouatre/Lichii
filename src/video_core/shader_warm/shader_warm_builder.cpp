@@ -12,8 +12,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -158,6 +160,27 @@ struct GraphicsProgram {
     std::vector<u32> archives;
     bool built{};
     u64 hash{};
+};
+
+struct MeshProgram {
+    bool built{};
+    u64 hash{};
+    std::vector<u8> env;
+};
+
+struct MeshSet {
+    size_t task{};
+    size_t mesh{};
+    size_t fragment{};
+    std::array<u32, 3> registers{};
+};
+
+constexpr size_t NoProgram = ~size_t{0};
+
+enum class JobKind {
+    Compute,
+    Graphics,
+    Mesh,
 };
 
 struct Job {
@@ -642,6 +665,12 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         std::vector<u8> env;
     };
     std::vector<HeldVertex> held_vertices;
+    std::unordered_map<u128, size_t, U128Hasher> mesh_index;
+    std::vector<MeshProgram> mesh_programs;
+    std::vector<MeshSet> mesh_sets;
+    std::set<std::tuple<size_t, size_t, size_t, std::array<u32, 3>>> mesh_set_keys;
+    std::optional<ShaderRecord> variation_fragment;
+    std::optional<ShaderRecord> variation_task;
     size_t archive_errors = 0;
     size_t member_errors = 0;
     size_t seq = 0;
@@ -653,15 +682,22 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     auto converter = std::make_unique<Converter>(threads, stop);
 
     // Consumes finished conversions in submission order (first program wins on equal keys).
-    std::vector<std::pair<bool, size_t>> job_kinds; // graphics?, graphics program index
+    std::vector<std::pair<JobKind, size_t>> job_kinds; // kind, graphics or mesh program index
     size_t consumed = 0;
     const auto consume = [&](JobResult&& r) {
-        const auto [is_graphics, index] = job_kinds[consumed++];
+        const auto [kind, index] = job_kinds[consumed++];
         if (!r.ok) {
             ++result.skipped;
             return;
         }
-        if (!is_graphics) {
+        if (kind == JobKind::Mesh) {
+            MeshProgram& program = mesh_programs[index];
+            program.built = true;
+            program.hash = r.hash;
+            program.env = std::move(r.bytes);
+            return;
+        }
+        if (kind == JobKind::Compute) {
             const std::string key(reinterpret_cast<const char*>(r.compute_key.data()),
                                   r.compute_key.size());
             if (compute_keys.insert(key).second) {
@@ -716,7 +752,63 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         const auto& archive = archives[archive_index];
         const auto data = archive.file->ReadAllBytes();
         const auto name = archive.path.substr(archive.path.rfind('/') + 1);
+        const auto push = [&](Job&& job, const ShaderRecord& record, JobKind kind,
+                              size_t index) {
+            job.seq = seq++;
+            job.program.assign(record.code.begin(), record.code.end());
+            job.constants.assign(record.constants.begin(), record.constants.end());
+            job_kinds.emplace_back(kind, index);
+            converter->Push(std::move(job));
+            while (converter->Pending() > MaxPendingJobs && !stop.stop_requested()) {
+                if (auto r = converter->Next(true)) {
+                    consume(std::move(*r));
+                }
+            }
+        };
+        const auto mesh_program = [&](const ShaderRecord& record, u32 stage) {
+            const auto [it, inserted] =
+                mesh_index.try_emplace(Hash128(record.code), mesh_programs.size());
+            if (inserted) {
+                mesh_programs.emplace_back();
+                Job job;
+                job.graphics = true;
+                job.stage = stage;
+                push(std::move(job), record, JobKind::Mesh, it->second);
+            }
+            return it->second;
+        };
         const auto on_record = [&](const ShaderRecord& record) {
+            if (record.new_variation) {
+                variation_fragment.reset();
+                variation_task.reset();
+            }
+            if (record.stage == ProgramStage::Task) {
+                variation_task = record;
+                return;
+            }
+            if (record.stage == ProgramStage::Mesh) {
+                if (!variation_fragment) {
+                    return;
+                }
+                const auto registers = ReadMeshRegisters(
+                    record.control,
+                    variation_task ? variation_task->control : std::span<const u8>{});
+                if (!registers) {
+                    ++result.skipped;
+                    return;
+                }
+                const MeshSet set{variation_task ? mesh_program(*variation_task, 7) : NoProgram,
+                                  mesh_program(record, 8), mesh_program(*variation_fragment, 4),
+                                  *registers};
+                if (mesh_set_keys.emplace(set.task, set.mesh, set.fragment, set.registers)
+                        .second) {
+                    mesh_sets.push_back(set);
+                }
+                return;
+            }
+            if (record.stage == ProgramStage::Fragment) {
+                variation_fragment = record;
+            }
             const bool is_graphics =
                 record.stage == ProgramStage::Vertex || record.stage == ProgramStage::Fragment;
             if (record.stage != ProgramStage::Compute && !is_graphics) {
@@ -752,16 +844,9 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                 job.control = *values;
                 job.stage = 5;
             }
-            job.seq = seq++;
-            job.program.assign(record.code.begin(), record.code.end());
-            job.constants.assign(record.constants.begin(), record.constants.end());
-            job_kinds.emplace_back(job.graphics, job.graphics_index);
-            converter->Push(std::move(job));
-            while (converter->Pending() > MaxPendingJobs && !stop.stop_requested()) {
-                if (auto r = converter->Next(true)) {
-                    consume(std::move(*r));
-                }
-            }
+            const size_t index = job.graphics_index;
+            push(std::move(job), record, is_graphics ? JobKind::Graphics : JobKind::Compute,
+                 index);
         };
         const auto on_member_error = [&](const std::string& error) {
             ++member_errors;
@@ -885,6 +970,53 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         held.env = {};
     }
     result.vertex_programs = vertex_keys.size();
+    // A draw without a task program keeps SET_MESH_INIT_SHADER from the previous task draw.
+    const GraphicsKey mesh_template = stats.templates[2] ? *stats.templates[2] : vertex_template;
+    std::set<u32> task_inits;
+    for (const MeshSet& set : mesh_sets) {
+        if (set.task != NoProgram) {
+            task_inits.insert(set.registers[2]);
+        }
+    }
+    if (task_inits.empty()) {
+        task_inits.insert(0);
+    }
+    for (const MeshSet& set : mesh_sets) {
+        const MeshProgram* const task = set.task != NoProgram ? &mesh_programs[set.task] : nullptr;
+        const MeshProgram& mesh = mesh_programs[set.mesh];
+        const MeshProgram& fragment = mesh_programs[set.fragment];
+        if ((task != nullptr && !task->built) || !mesh.built || !fragment.built) {
+            continue;
+        }
+        const std::set<u32> inits = task != nullptr ? std::set<u32>{set.registers[2]} : task_inits;
+        for (const u32 init : inits) {
+            const std::array<u32, 3> registers{set.registers[0], set.registers[1], init};
+            const u64 state = MeshStateHash(registers);
+            GraphicsKey key = mesh_template;
+            const auto write_env = [&](const MeshProgram& program, size_t slot, u64 hash,
+                                       bool mesh_state) {
+                std::memcpy(key.data() + slot * sizeof(u64), &hash, sizeof(hash));
+                graphics_out.write(reinterpret_cast<const char*>(program.env.data()),
+                                   static_cast<std::streamsize>(program.env.size()));
+                if (mesh_state) {
+                    const std::array<u8, 80> no_header{};
+                    graphics_out.write(reinterpret_cast<const char*>(registers.data()),
+                                       sizeof(registers));
+                    graphics_out.write(reinterpret_cast<const char*>(no_header.data()),
+                                       no_header.size());
+                }
+            };
+            Write(graphics_out, u32{task != nullptr ? 3U : 2U});
+            if (task != nullptr) {
+                write_env(*task, 1, task->hash ^ state, true);
+            }
+            write_env(mesh, task != nullptr ? 3 : 1, mesh.hash ^ state, true);
+            write_env(fragment, 5, fragment.hash, false);
+            graphics_out.write(reinterpret_cast<const char*>(key.data()),
+                               static_cast<std::streamsize>(key.size()));
+            ++result.mesh_entries;
+        }
+    }
     compute_out.close();
     graphics_out.close();
     if (!compute_out || !graphics_out) {
@@ -923,14 +1055,15 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         return fail("Cannot replace " + Common::FS::PathToUTF8String(graphics_path));
     }
     WriteWarmCount(compute_path, result.compute_programs);
-    WriteWarmCount(graphics_path, result.vertex_programs + result.fragment_programs);
+    WriteWarmCount(graphics_path,
+                   result.vertex_programs + result.fragment_programs + result.mesh_entries);
     report(StageWriting, patches.size(), patches.size());
     result.ok = true;
     LOG_INFO(Render_Vulkan,
-             "Shader precache build for {:016x}: {} compute, {} vertex, {} fragment entries, {} "
-             "programs skipped, {} archive and {} member errors, {:.1f} s",
+             "Shader precache build for {:016x}: {} compute, {} vertex, {} fragment, {} task/mesh "
+             "entries, {} programs skipped, {} archive and {} member errors, {:.1f} s",
              title_id, result.compute_programs, result.vertex_programs, result.fragment_programs,
-             result.skipped, archive_errors, member_errors,
+             result.mesh_entries, result.skipped, archive_errors, member_errors,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     return result;
 }

@@ -152,6 +152,7 @@ struct Result {
     size_t compute_programs{};   ///< Entries written to the precache file
     size_t vertex_programs{};    ///< Vertex entries written to the graphics precache file
     size_t fragment_programs{};  ///< Fragment entries written to the graphics precache file
+    size_t mesh_entries{};
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
 
