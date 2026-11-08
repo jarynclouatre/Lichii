@@ -75,6 +75,29 @@ class RescalingPushConstant;
 class RenderAreaPushConstant;
 class Scheduler;
 
+/// Mesh emulation on a device without VK_EXT_mesh_shader: the mesh program (stage 0) is built as
+/// a compute shader that writes its output to a storage buffer, and this vertex shader draws it
+/// (see Shader::Backend::SPIRV::EmitMeshEmulationVertex).
+struct MeshEmulationSetup {
+    std::vector<u32> vertex_spirv;
+    u32 output_binding{};
+    u32 block_words{};    ///< output words per mesh workgroup
+    u32 max_primitives{}; ///< triangles per mesh workgroup
+    // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
+    // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
+    bool has_task{};
+    u32 mesh_stage{};
+    u32 payload_stride{};
+    u32 payload_binding{};
+    u32 offsets_binding{};
+    u32 args_binding{};
+    std::vector<u32> distribution_spirv;
+    // Output layout, for the readback diagnostics.
+    u32 max_vertices{};
+    u32 vertex_lines{};
+    std::array<u32, 4> position_lines{~0U, ~0U, ~0U, ~0U}; ///< line of PositionX..W
+};
+
 class GraphicsPipeline {
     static constexpr size_t NUM_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStage;
 
@@ -88,7 +111,8 @@ public:
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
         const std::array<const Shader::Info*, NUM_STAGES>& infos,
-        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {});
+        std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
+        std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt);
 
     static std::chrono::nanoseconds TakeHoldTime() noexcept;
 
@@ -135,6 +159,59 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+
+    /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
+    [[nodiscard]] bool IsEmulatedMesh() const noexcept {
+        return mesh_emulation.has_value();
+    }
+
+    /// Output bytes the emulation needs for one mesh workgroup.
+    [[nodiscard]] u64 MeshEmulationBlockBytes() const noexcept {
+        return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
+    }
+
+    /// Vertices of the emulation's triangle list for one mesh workgroup.
+    [[nodiscard]] u32 MeshEmulationVerticesPerGroup() const noexcept {
+        return mesh_emulation ? mesh_emulation->max_primitives * 3 : 0;
+    }
+
+    /// The emulation's setup (output layout), or null.
+    [[nodiscard]] const MeshEmulationSetup* MeshEmulation() const noexcept {
+        return mesh_emulation ? &*mesh_emulation : nullptr;
+    }
+
+    /// The emulation's output buffer and workgroup count for the next Configure.
+    void SetMeshEmulationOutput(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                                u32 groups) noexcept {
+        mesh_output_buffer = buffer;
+        mesh_output_offset = offset;
+        mesh_output_size = size;
+        mesh_groups = groups;
+    }
+
+    struct MeshEmulationBuffer {
+        VkBuffer buffer{};
+        VkDeviceSize offset{};
+        VkDeviceSize size{};
+    };
+    /// With a task program: the task payload, offset and argument buffers, the arena counter,
+    /// and the words of the output arena (the draw's group count is the task's).
+    void SetMeshEmulationTaskBuffers(const MeshEmulationBuffer& payload,
+                                     const MeshEmulationBuffer& offsets,
+                                     const MeshEmulationBuffer& args,
+                                     const MeshEmulationBuffer& counter,
+                                     u32 capacity_words) noexcept {
+        mesh_task_buffers = {payload, offsets, args, counter};
+        mesh_capacity = capacity_words;
+    }
+
+    [[nodiscard]] bool MeshEmulationHasTask() const noexcept {
+        return mesh_emulation && mesh_emulation->has_task;
+    }
+
+    [[nodiscard]] u32 MeshEmulationPayloadStride() const noexcept {
+        return mesh_emulation ? mesh_emulation->payload_stride : 0;
+    }
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
@@ -178,6 +255,15 @@ public:
         transitions.clear();
     }
 
+    [[nodiscard]] bool WritesStorage() const noexcept {
+        return writes_storage;
+    }
+
+    /// Writes storage images or image buffers (their images are marked modified when resolved).
+    [[nodiscard]] bool WritesImages() const noexcept {
+        return writes_images;
+    }
+
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }
@@ -189,6 +275,48 @@ public:
 
     [[nodiscard]] bool Failed() const noexcept {
         return build->Failed();
+    }
+
+    /// Fast draw (nx2_fast_draw.h): whether draws can keep the image views and samplers the last
+    /// captured Configure resolved. Handles computed at draw time are resolved on every draw.
+    [[nodiscard]] bool TakesDeltaDraws() const noexcept {
+        return delta_blocker == DeltaBlocker::None && delta_views_valid;
+    }
+
+    /// Why TakesDeltaDraws is false (diagnostics).
+    enum class DeltaBlocker : u8 {
+        None,
+        WritesImages,
+        Mesh,
+        ComputedHandles,
+        NotConfigured,
+        Count,
+    };
+    [[nodiscard]] DeltaBlocker DeltaDrawBlocker() const noexcept {
+        return delta_blocker != DeltaBlocker::None ? delta_blocker
+               : delta_views_valid                 ? DeltaBlocker::None
+                                                   : DeltaBlocker::NotConfigured;
+    }
+
+    /// Constant buffer slots per stage the pipeline reads texture and image handles from.
+    [[nodiscard]] const std::array<u32, NUM_STAGES>& HandleConstantBuffers() const noexcept {
+        return handle_constant_buffers;
+    }
+
+    /// Resolves and binds every buffer as Configure does (storage buffer addresses are read from
+    /// the constant buffers again) and records the draw's descriptors with the image views,
+    /// samplers and texture buffers the last captured Configure resolved. False when the draw
+    /// can't be recorded, as for Configure.
+    bool ConfigureDelta(bool is_indexed);
+
+    /// The next Configure keeps the views and samplers it resolves for delta draws. With
+    /// `verify`, it first compares them with the ones kept before; DeltaMismatch reports it.
+    void CaptureNextDelta(bool verify) noexcept {
+        capture_delta = true;
+        verify_delta = verify;
+    }
+    [[nodiscard]] bool DeltaMismatch() const noexcept {
+        return delta_mismatch;
     }
 
     template <typename Spec>
@@ -242,6 +370,21 @@ private:
     bool fragment_has_color0_output{};
     u32 color_output_mask{};
     bool writes_storage{};
+    /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
+    /// resolve them from texture_memo.
+    bool texture_memo_eligible{};
+    VideoCommon::SampledTextureMemo texture_memo;
+    bool writes_images{};
+
+    DeltaBlocker delta_blocker{};
+    bool delta_views_valid{};
+    bool capture_delta{};
+    bool verify_delta{};
+    bool delta_mismatch{};
+    std::array<bool, NUM_STAGES> configured_stages{};
+    std::array<u32, NUM_STAGES> handle_constant_buffers{};
+    std::vector<VideoCommon::ImageViewInOut> delta_views;
+    std::vector<VideoCommon::SamplerId> delta_samplers;
 
     vk::DescriptorSetLayout descriptor_set_layout;
     DescriptorAllocator descriptor_allocator;
@@ -258,6 +401,27 @@ private:
     const bool worker_only_build;
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
+
+    // Mesh emulation (MeshEmulationSetup).
+    std::optional<MeshEmulationSetup> mesh_emulation;
+    vk::ShaderModule mesh_vertex_module;
+    vk::Pipeline mesh_compute_pipeline;
+    VkDescriptorSet mesh_descriptor_set{}; ///< shared by the dispatch and the draw it feeds
+    VkBuffer mesh_output_buffer{};
+    VkDeviceSize mesh_output_offset{};
+    VkDeviceSize mesh_output_size{};
+    u32 mesh_groups{};
+    // With a task program: its compute pipeline, the distribution pass between it and the mesh
+    // dispatch, and the per-draw buffers (payload, offsets, arguments, arena counter).
+    vk::Pipeline task_compute_pipeline;
+    vk::ShaderModule distribution_module;
+    vk::DescriptorSetLayout distribution_set_layout;
+    vk::PipelineLayout distribution_layout;
+    vk::Pipeline distribution_pipeline;
+    DescriptorAllocator distribution_allocator;
+    std::array<MeshEmulationBuffer, 4> mesh_task_buffers{};
+    u32 mesh_capacity{};
+
     std::optional<PipelineBuild> build;
 };
 

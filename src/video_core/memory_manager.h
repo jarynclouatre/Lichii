@@ -149,6 +149,11 @@ public:
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
         GPUVAddr gpu_addr, std::size_t size) const;
 
+    /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
+    /// end of the address space.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
+        GPUVAddr gpu_addr, std::size_t size) const;
+
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
                  PTEKind kind = PTEKind::INVALID, bool is_big_pages = true);
     GPUVAddr MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages = true);
@@ -167,6 +172,12 @@ public:
 
     [[nodiscard]] u64 MapSerial() const {
         return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
+    /// a host pointer GetPointer returned is only good while it stays the same.
+    [[nodiscard]] u64 HostPointerSerial() const {
+        return MapSerial() + memory.TranslationGeneration();
     }
 
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).

@@ -314,7 +314,15 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
         }
         const Id pointer{
             AttrPointer(ctx, generic.pointer_type, vertex, generic.id, ctx.Const(element))};
-        const Id value{ctx.OpLoad(generic.component_type, pointer)};
+        Id value{ctx.OpLoad(generic.component_type, pointer)};
+        if (ctx.stage == Stage::Fragment && ctx.noperspective_as_smooth_inputs[index]) {
+            // Written times Position.w and interpolated perspective-correct: undo with 1/w.
+            // Only float inputs are marked, and DefineInputs forces FragCoord for them.
+            ASSERT(generic.load_op == InputGenericLoadOp::None && ValidId(ctx.input_position));
+            const Id frag_w{ctx.OpLoad(
+                ctx.F32[1], ctx.OpAccessChain(ctx.input_f32, ctx.input_position, ctx.Const(3u)))};
+            value = ctx.OpFMul(ctx.F32[1], value, frag_w);
+        }
         return [&ctx, generic, value]() {
             switch (generic.load_op) {
             case InputGenericLoadOp::Bitcast:
@@ -422,13 +430,6 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, [[maybe_un
         value = ctx.OpBitcast(output->type, value);
     }
 
-    static constexpr IR::Attribute cd0 = IR::Attribute::ClipDistance0;
-    static constexpr IR::Attribute cd7 = IR::Attribute::ClipDistance7;
-
-    if (attr >= cd0 && attr <= cd7) {
-        const u32 idx = (u32) attr - (u32) cd0;
-        clip_distance_written.set(idx);
-    }
     ctx.OpStore(output->pointer, value);
 }
 
@@ -554,6 +555,13 @@ void EmitSetOFlag(EmitContext&) {
 }
 
 Id EmitWorkgroupId(EmitContext& ctx) {
+    if (Sirit::ValidId(ctx.mesh_group_index)) {
+        // Mesh emulation with a task: a mesh workgroup's index is within its task's, as in a
+        // mesh shader launched by a task shader.
+        const Id zero{ctx.u32_zero_value};
+        return ctx.OpCompositeConstruct(ctx.U32[3], ctx.OpLoad(ctx.U32[1], ctx.mesh_group_index),
+                                        zero, zero);
+    }
     return ctx.OpLoad(ctx.U32[3], ctx.workgroup_id);
 }
 

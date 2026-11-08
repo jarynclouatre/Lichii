@@ -76,6 +76,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
+    FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
@@ -333,6 +334,11 @@ public:
         return properties.properties.driverVersion;
     }
 
+    /// Returns the PCI device ID of the physical device.
+    u32 GetDeviceID() const {
+        return properties.properties.deviceID;
+    }
+
     /// Returns the device name.
     std::string_view GetModelName() const {
         return properties.properties.deviceName;
@@ -488,7 +494,13 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if the device supports float16 natively.
     bool IsFloat16Supported() const {
-        return features.shader_float16_int8.shaderFloat16;
+        return float16_math;
+    }
+
+    /// Whether host-only shaders (frame generation) may use float16. Unlike IsFloat16Supported, it
+    /// stays on under the NVIDIA Ampere workaround, which concerns guest shaders only.
+    bool IsHostFloat16Supported() const {
+        return host_float16_supported;
     }
 
     /// Returns true if the device can run shaders built against the Vulkan memory model.
@@ -665,6 +677,18 @@ FN_MAX_LIMIT_LIST
         return extensions.workgroup_memory_explicit_layout &&
                features.workgroup_memory_explicit_layout.workgroupMemoryExplicitLayout16BitAccess &&
                features.features.shaderInt16;
+    }
+
+    /// Returns true if the guest's HMMA.16816.F16 can run on the host's cooperative matrices
+    /// (VK_KHR_cooperative_matrix with the same 16x8x16 shape on 16-bit floats, 32-lane subgroups).
+    bool IsCooperativeHmmaSupported() const {
+        return cooperative_hmma_16x8x16;
+    }
+
+    /// Returns true if the guest's HMMA can run through shared memory on 16x16x16 cooperative
+    /// matrices of 16-bit floats, with compute subgroups forced to the guest's 32 lanes.
+    bool IsCooperativeHmma16x16x16Supported() const {
+        return cooperative_hmma_16x16x16;
     }
 
     /// Returns true if the device supports VK_KHR_shader_quad_control.
@@ -1309,6 +1333,8 @@ private:
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
+        VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
+        VkPhysicalDeviceShaderIntegerDotProductProperties integer_dot_product{};
 
         VkPhysicalDeviceProperties properties{};
     };
@@ -1326,11 +1352,15 @@ private:
     bool is_blit_depth24_stencil8_supported{}; ///< Support for blitting from and to D24S8.
     bool is_blit_depth32_stencil8_supported{}; ///< Support for blitting from and to D32S8.
     bool is_warp_potentially_bigger{};         ///< Host warp size can be bigger than guest.
+    bool float16_math{};                       ///< Shaders may do float16 arithmetic.
+    bool cooperative_hmma_16x8x16{};           ///< HMMA runs on the guest's matrix shape.
+    bool cooperative_hmma_16x16x16{};          ///< HMMA runs on 16x16x16 matrices.
     bool is_integrated{};                      ///< Is GPU an iGPU.
     bool is_virtual{};                         ///< Is GPU a virtual GPU.
     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
+    bool host_float16_supported{};             ///< shaderFloat16 for host-only shaders
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
     bool has_renderdoc{};                      ///< Has RenderDoc attached

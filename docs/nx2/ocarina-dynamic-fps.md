@@ -12,9 +12,13 @@ Dark, an Eglantine developer, wrote the routine. This port preserves the call an
 120-byte routine from Frizti's `oot-gather-fix` commit
 `765659af4ccb7201d1145c57f3b45ce84653cea0`. That commit explicitly states that
 Dark gave permission to bundle it. Frizti supplied the built-in integration.
+CTGL's #299 changed one instruction: the delta cap is `CNTFRQ / 10` instead of
+`CNTFRQ / 20`.
 
 The routine's SHA-256 is
-`3c15dfb57f748328ad7d1c1675941dc2ace32a5e7b10907368ceac6a9a8c5ee1`.
+`0afb4af10a78bb49372e6807fc5b71d9fa99d828b7625f0fab7429fc66a4b1e6`
+(`3c15dfb57f748328ad7d1c1675941dc2ace32a5e7b10907368ceac6a9a8c5ee1` before the
+cap change).
 The call's SHA-256 is
 `e4d3f65ad1b568b557f02b9a087a9c304240ac70d6ef474dac83a1f97737515e`.
 This port adds original-byte and memory-layout guards, and
@@ -51,7 +55,7 @@ instruction, layout, or truncated module leaves both patch records untouched.
 ## Timing limits
 
 The routine reads `CNTPCT_EL0` and `CNTFRQ_EL0`. After its first call, it caps
-the timestamp difference at `CNTFRQ / 20`, or 50 ms, then smooths it by adding
+the timestamp difference at `CNTFRQ / 10`, or 100 ms, then smooths it by adding
 one eighth of the signed difference from the previous smoothed value.
 It calculates `s2 = (smoothed_ticks / CNTFRQ) * s1`. It replaces the original
 `s8 = s1 / s0` only when `s2 > 1.03 * s8`.

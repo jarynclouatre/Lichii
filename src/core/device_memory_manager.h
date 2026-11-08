@@ -73,6 +73,12 @@ public:
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
 
+    /// Changes whenever Map or Unmap ran: host pointers GetPointer returned before are only good
+    /// while it stays the same.
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
     // Write / Read
     template <typename T>
     T* GetPointer(DAddr address);

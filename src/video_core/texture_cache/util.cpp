@@ -33,6 +33,7 @@
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/host_mip_limits.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/textures/astc.h"
@@ -1443,6 +1444,37 @@ Extent3D MipBlockSize(const ImageInfo& info, u32 level) {
     return AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
 }
 
+bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                           std::span<const ImageCopy> copies) {
+    constexpr ImageFlagBits excluded = ImageFlagBits::Rescaled | ImageFlagBits::TrimmedLevels |
+                                       ImageFlagBits::Unbacked | ImageFlagBits::UnwrittenSparse |
+                                       ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles;
+    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D ||
+        src.info.format != dst.info.format || src.info.astc_opaque != dst.info.astc_opaque ||
+        True((src.flags | dst.flags) & excluded)) {
+        return false;
+    }
+    // Alias copies count a compressed extent in blocks, but the backends copy it as texels, so
+    // such a copy writes only part of the image.
+    if (DefaultBlockWidth(dst.info.format) != 1 || DefaultBlockHeight(dst.info.format) != 1) {
+        return false;
+    }
+    for (s32 level = 0; level < dst.info.resources.levels; ++level) {
+        const Extent3D size = MipSize(dst.info.size, level);
+        const bool covered = std::ranges::any_of(copies, [&](const ImageCopy& copy) {
+            return copy.dst_subresource.base_level == level &&
+                   copy.dst_subresource.base_layer == 0 &&
+                   copy.dst_subresource.num_layers >= dst.info.resources.layers &&
+                   copy.dst_offset == Offset3D{} && copy.extent.width >= size.width &&
+                   copy.extent.height >= size.height;
+        });
+        if (!covered) {
+            return false;
+        }
+    }
+    return true;
+}
+
 boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {
     const Extent2D tile_size = DefaultBlockSize(info.format);
     if (info.type == ImageType::Linear) {
@@ -1480,6 +1512,16 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
                   Common::ScratchBuffer<u8>& tmp_buffer) {
     const bool is_pitch_linear = info.type == ImageType::Linear;
     for (const BufferImageCopy& copy : copies) {
+        const u32 levels =
+            info.num_samples > 1
+                ? 1
+                : HostMipLevelCount(info.size.width, info.size.height, info.size.depth,
+                                    static_cast<u32>(info.resources.levels));
+        if (!IsHostMipLevel(copy.image_subresource.base_level, levels)) {
+            // The host did not download this tail level. Preserve the guest bytes.
+            continue;
+        }
+
         if (is_pitch_linear) {
             SwizzlePitchLinearImage(gpu_memory, gpu_addr, info, copy, memory);
         } else {

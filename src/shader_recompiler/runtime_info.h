@@ -88,6 +88,12 @@ struct RuntimeInfo {
     VaryingState previous_stage_stores;
     /// Fragment stage after a mesh program: generic inputs it writes per primitive.
     std::bitset<32> per_primitive_generics{};
+    /// Last pre-rasterization stage: generic outputs the fragment stage reads screen-linear.
+    /// They are written times Position.w and the fragment stage reads them perspective-correct
+    /// times FragCoord.w, so clipping a primitive close to the camera interpolates them right.
+    std::bitset<32> noperspective_outputs{};
+    /// Fragment stage: the previous stage writes noperspective_outputs (not a mesh program).
+    bool scaled_noperspective_inputs{};
     std::map<IR::Attribute, IR::Attribute> previous_stage_legacy_stores_mapping;
 
     bool convert_depth_mode{};
@@ -117,6 +123,22 @@ struct RuntimeInfo {
 
     /// Dual source blending
     bool dual_source_blend{};
+
+    /// Mesh program on a device without VK_EXT_mesh_shader: emit it as a compute shader that
+    /// writes its vertices and primitives to the storage buffer at mesh_output_binding (see
+    /// EmitMeshEmulationVertex for the layout), for a vertex shader to draw them.
+    bool mesh_as_compute{};
+    u32 mesh_output_binding{};
+    /// Mesh emulation with a task program (mesh_as_compute on both). The task's compute shader
+    /// writes its payload (count at word 1) to the payload buffer, task_payload_words words per
+    /// task workgroup. Each mesh workgroup finds its task by a binary search of the offsets
+    /// buffer (first mesh workgroup of each task) and copies that task's payload. The arguments
+    /// buffer holds the draw's output base and task count (MESH_EMULATION_ARGS_*). ~0 when there
+    /// is no task program.
+    u32 mesh_task_payload_binding{~0U};
+    u32 mesh_task_offsets_binding{~0U};
+    u32 mesh_task_args_binding{~0U};
+    u32 mesh_task_payload_stride{}; ///< payload buffer words per task workgroup
 };
 
 } // namespace Shader

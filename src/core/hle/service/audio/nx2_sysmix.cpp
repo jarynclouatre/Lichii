@@ -6,9 +6,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 
+#include "audio_core/sink/silent_input_stream.h"
 #include "audio_core/sink/sink.h"
 #include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
@@ -54,13 +56,28 @@ struct SysmixOutput::Impl {
         open = false;
         engaged = false;
         data_mode = 0;
-        if (host) {
-            sink.CloseStream(host);
-            host = nullptr;
-        }
+        ReleaseHost();
         if (state_event) {
             state_event->Signal(system.Kernel());
         }
+    }
+
+    void ReleaseHost() {
+        if (host == silent_input.get()) {
+            silent_input.reset();
+        } else {
+            sink.CloseStream(host);
+        }
+        host = nullptr;
+    }
+
+    /// Replace a host microphone that failed to open or start with silence the guest can capture.
+    void UseSilentInput(u32 guest_channels) {
+        LOG_WARNING(Service_Audio,
+                    "sysmix stream {}: host microphone unavailable, capturing silence", id);
+        ReleaseHost();
+        silent_input = std::make_unique<AudioCore::Sink::SilentInputStream>(system, guest_channels);
+        host = silent_input.get();
     }
 
     /// Stop admission and notify the guest after invalid memory or a fatal host-stream failure.
@@ -108,11 +125,11 @@ struct SysmixOutput::Impl {
                 .count());
         LOG_INFO(Service_Audio,
                  "sysmix stream {} output: copied={} accepted={} nonzero={} blocks={} full={} "
-                 "queued={} retried={} padded={} filled={} emu_us={}",
+                 "queued={} retried={} padded={} deferred={} filled={} emu_us={}",
                  id, counters.copied_frames, counters.accepted_frames, counters.nonzero_frames,
                  counters.admitted_blocks, counters.backpressure,
                  host ? host->GetQueueSize() : 0, counters.retried_frames, counters.padded_frames,
-                 filled, emu_us);
+                 counters.deferred, filled, emu_us);
     }
 
     Core::System& system;
@@ -122,6 +139,7 @@ struct SysmixOutput::Impl {
     Kernel::KEvent* state_event{};
     Kernel::KEvent* data_event{};
     AudioCore::Sink::SinkStream* host{};
+    std::unique_ptr<AudioCore::Sink::SinkStream> silent_input;
     mutable std::mutex mutex;
     u32 id;
     u64 buffer;
@@ -211,11 +229,11 @@ Result SysmixOutput::Open(u32 sample_type, u32 channels, u32 rate, u32 frames, u
     p.host = p.sink.AcquireSinkStream(p.system, channels, "sysmix-" + std::to_string(p.id),
                                       p.input_stream ? AudioCore::Sink::StreamType::In
                                                      : AudioCore::Sink::StreamType::Sysmix);
+    if (p.input_stream && (!p.host || !p.host->IsReady())) {
+        p.UseSilentInput(channels);
+    }
     if (!p.host || !p.host->IsReady()) {
-        if (p.host) {
-            p.sink.CloseStream(p.host);
-            p.host = nullptr;
-        }
+        p.ReleaseHost();
         R_RETURN(ResultOperationFailed);
     }
     p.slots = static_cast<u32>(slots);
@@ -250,6 +268,10 @@ Result SysmixOutput::SetEngaged(bool engaged) {
     }
     if (engaged) {
         p.host->Start();
+        if (p.input_stream && (!p.host->IsReady() || p.host->IsPaused())) {
+            p.UseSilentInput(p.channels);
+            p.host->Start();
+        }
         R_UNLESS(p.host->IsReady() && !p.host->IsPaused(), ResultOperationFailed);
     } else {
         p.host->Stop();
@@ -404,6 +426,16 @@ void SysmixOutput::Pump() {
         return;
     }
     const u32 taken = std::min(filled, BlockFrames);
+    // A short block is padded with silence. That is right for a real underrun, but while the host
+    // still has audio to play the guest is only a little behind this tick, and padding would cut a
+    // gap into continuous audio. Wait for a whole block until the host drains, so a guest that
+    // waits on fewer than BlockFrames frames (a high notification threshold) still makes progress.
+    // The queue size alone is not enough: it is zero while the last block is still playing.
+    if (taken < BlockFrames && p.host->HasPendingAudio()) {
+        ++p.counters.deferred;
+        p.Notify(filled);
+        return;
+    }
     const u32 first = std::min(taken, p.slots - read);
     const u32 second = taken - first;
     auto& memory = p.process->GetMemory();

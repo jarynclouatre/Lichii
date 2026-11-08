@@ -6,81 +6,19 @@
 #include <array>
 #include <filesystem>
 #include <functional>
-#include <list>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
-#include "common/fs/file.h"
 #include "core/file_sys/vfs/vfs_types.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/loader/loader.h"
 
 namespace FileSys {
 
-/// A zstd member too large for the in-memory cache, decompressed once into a temporary file.
-struct NupSpillFile {
-    ~NupSpillFile();
-
-    std::mutex mutex;
-    std::filesystem::path path;
-    Common::FS::IOFile file;
-    bool attempted{};
-};
-
-/// LRU over decompressed zstd extents, shared by the files of one container.
-struct NupDecompressCache {
-    static constexpr std::size_t DefaultCap = 512 * 1024 * 1024;
-
-    using Entry = std::pair<std::size_t, std::vector<u8>>;
-
-    std::mutex mutex;
-    std::list<Entry> lru;
-    std::unordered_map<std::size_t, std::list<Entry>::iterator> index;
-    std::size_t bytes{};
-    std::size_t cap{DefaultCap};
-    std::filesystem::path spill_dir;
-    std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
-
-    std::vector<u8>* Find(std::size_t file_index) {
-        const auto it = index.find(file_index);
-        if (it == index.end()) {
-            return nullptr;
-        }
-        lru.splice(lru.begin(), lru, it->second);
-        return &it->second->second;
-    }
-
-    /// Takes ownership of `data` only when it is inserted.
-    void Insert(std::size_t file_index, std::vector<u8>& data) {
-        if (index.contains(file_index)) {
-            return;
-        }
-        while (bytes + data.size() > cap && !lru.empty()) {
-            bytes -= lru.back().second.size();
-            index.erase(lru.back().first);
-            lru.pop_back();
-        }
-        if (bytes + data.size() > cap) {
-            return;
-        }
-        bytes += data.size();
-        lru.emplace_front(file_index, std::move(data));
-        index.emplace(file_index, lru.begin());
-    }
-
-    std::shared_ptr<NupSpillFile> GetSpill(std::size_t file_index) {
-        auto& spill = spills[file_index];
-        if (!spill) {
-            spill = std::make_shared<NupSpillFile>();
-        }
-        return spill;
-    }
-};
+struct NupDecompressCache;
 
 /**
  * NUP (NX Package) container: stores loose ExeFS/RomFS trees for a base program,
@@ -96,6 +34,8 @@ struct NupDecompressCache {
 class NupContainer {
 public:
     static constexpr std::array<u8, 4> HeaderMagic{'N', 'U', 'P', 0x01};
+    /// Memory budget for decoded zstd members.
+    static constexpr std::size_t DefaultCacheCap = 512 * 1024 * 1024;
 
     enum class PackageKind : u8 {
         Base = 0,
@@ -133,8 +73,7 @@ public:
 
     /// Zstd members larger than half of `memory_cache_cap` are decompressed to a temporary file
     /// in `spill_dir` (the cache directory by default) instead of being held in memory.
-    explicit NupContainer(VirtualFile file_,
-                          std::size_t memory_cache_cap = NupDecompressCache::DefaultCap,
+    explicit NupContainer(VirtualFile file_, std::size_t memory_cache_cap = DefaultCacheCap,
                           std::filesystem::path spill_dir_ = {});
     ~NupContainer();
 
@@ -153,8 +92,8 @@ public:
     std::optional<std::size_t> FindBestUpdatePackage() const;
 
     /// Opens a member file by node index; raw extents are zero-copy views into
-    /// the container, zstd extents are lazily decompressed, cached in memory
-    /// or, when large, in a temporary file.
+    /// the container, zstd extents are decompressed only as far as reads reach,
+    /// cached in memory or, when large, in a temporary file.
     VirtualFile OpenFile(std::size_t file_index);
 
     VirtualDir GetExeFSDir(std::size_t package_index);
@@ -167,6 +106,11 @@ public:
 
     std::size_t GetFileCount() const {
         return files.size();
+    }
+
+    bool IsZstdMember(std::size_t file_index) const {
+        return file_index < files.size() && files[file_index].size != 0 &&
+               files[file_index].codec != 0;
     }
 
 private:

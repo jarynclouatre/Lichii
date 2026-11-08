@@ -39,6 +39,7 @@
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra {
@@ -1349,7 +1350,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                           std::span<const u32> parameters) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     if (native_turing) {
-        maxwell3d.RefreshParameters();
+        // The parameters are the words the pusher fetched, as on the split front (FrontRunMacro):
+        // read again from guest memory, they are whatever reused that command memory since.
         const auto context = reinterpret_cast<std::uintptr_t>(this);
         static std::unordered_set<std::uintptr_t> captured_contexts;
         static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
@@ -1609,8 +1611,12 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
 
         UNREACHABLE();
     };
+    // HLE programs write registers directly, without the 3D engine's fast draw breaks.
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
     if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
+        FastDraw::Break(FastDraw::Reason::Method, method);
         execute_variant(it->second.program);
+        FastDraw::Break(FastDraw::Reason::Method, method);
         return;
     }
 
@@ -1651,7 +1657,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         ci.program = Compile(system, maxwell3d, code);
     }
 
+    FastDraw::Break(FastDraw::Reason::Method, method);
     execute_variant(ci.program);
+    FastDraw::Break(FastDraw::Reason::Method, method);
     if (Settings::values.dump_macros) {
         Dump(ci.hash, code, !std::holds_alternative<std::monostate>(ci.program));
     }

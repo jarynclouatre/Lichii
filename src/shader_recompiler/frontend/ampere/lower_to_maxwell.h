@@ -305,10 +305,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         bool requires_shadow = false;
         for (u32 bit : {16U, 24U, 32U, 64U}) {
             if (opcode == 0x81c) break;
-            // Bits 32-39 name a register in register forms and in these opcodes: TEX/TLD, the
-            // stores, and the data operand of ISBEWR (0x927), RED (0x98e) and SURED (0x59f), all
-            // three listed with operand 32 in RegisterPressure.
-            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0x986 && opcode != 0x987 && opcode != 0xf66 && opcode != 0x988 && opcode != 0x927 && opcode != 0x98e && opcode != 0x59f) continue;
+            // Bits 32-39 name a register in register forms and in these opcodes: TEX/TLD, TXD's
+            // gradients, and the data operand of the stores, ISBEWR (0x927), the global atomic
+            // (0x9a8), RED (0x98e) and SURED (0x59f), all listed with operand 32 in RegisterPressure.
+            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xb6c && opcode != 0xf6c && opcode != 0x986 && opcode != 0x987 && opcode != 0xf66 && opcode != 0x988 && opcode != 0x927 && opcode != 0x9a8 && opcode != 0x98e && opcode != 0x59f) continue;
             const u32 reg = insn.Bits(bit, 8);
             if (reg >= (uses_uniform_bank ? high_uniform_base : 246U) && reg < 255)
                 requires_shadow = true;
@@ -2540,7 +2540,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (half && (bindless || offsets || !insn.Bits(60, 1) || insn.Bits(80, 1) ||
                           insn.Bits(91, 1) ||
                           (source_b != 255 && source_b >= register_limit) ||
-                          mask != 15 || dest >= register_limit || second_dest >= register_limit)) ||
+                          dest >= register_limit ||
+                          // Up to two taps pack into dest alone (mask 3 with no second register).
+                          (std::popcount(mask) > 2 && second_dest >= register_limit))) ||
                 (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245))) ||
                 (per_tap && (bindless || depth || insn.Bits(80, 1) || insn.Bits(91, 1))) ||
                 insn.Bits(89, 1) || mask == 0 ||
@@ -2688,11 +2690,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{per_tap ? 2U : offsets ? 1U : 0U} << 54) | (u64{insn.Bits(87, 2)} << 56));
             }
             if (half) {
-                for (u32 i = 0; i < 2; ++i) {
+                // The gather writes its taps packed from R250; an odd last tap pairs with RZ.
+                const u32 taps = static_cast<u32>(std::popcount(mask));
+                for (u32 i = 0; i * 2 < taps; ++i) {
                     emit(0x5ca8000000000000ULL | predicate | 246 | (u64{1} << 8) | (u64{2} << 10) |
                          (u64{250 + i * 2} << 20));
                     emit(0x5ca8000000000000ULL | predicate | 247 | (u64{1} << 8) | (u64{2} << 10) |
-                         (u64{251 + i * 2} << 20));
+                         (u64{i * 2 + 1 < taps ? 251 + i * 2 : 255U} << 20));
                     emit(0x5c18000000000000ULL | predicate | (i == 0 ? dest : second_dest) |
                          (u64{247} << 8) | (u64{246} << 20) | (u64{16} << 39));
                 }

@@ -67,6 +67,10 @@ public:
     [[nodiscard]] bool Active() const {
         return active;
     }
+    /// How often the split started: state the front copied during an earlier start is stale.
+    [[nodiscard]] u32 Starts() const {
+        return starts;
+    }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
@@ -123,13 +127,17 @@ public:
         Commit(1);
     }
 
+    /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
+    static constexpr u64 FastDrawNeutral = 1 << 7;
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func) {
+    void Defer(const Func& func, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
@@ -240,6 +248,7 @@ private:
 
     Core::System* system{};
     bool active{};
+    u32 starts{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 

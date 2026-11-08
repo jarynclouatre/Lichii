@@ -480,6 +480,8 @@ public:
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
 
+    u32 HostMipLevels() const noexcept;
+
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
         return !original_image && info.type != VideoCommon::ImageType::Buffer;
@@ -848,6 +850,7 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare;
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
