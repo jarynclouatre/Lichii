@@ -373,6 +373,16 @@ public:
     static constexpr u32 AcquireGequal = 0x4;
     static constexpr u32 AcquireMask = 0x8;
 
+    /// TEST (EDEN_NX2_ACQUIRE_STATS): the writer that latched a waiter (OnWrite).
+    enum class Source : u8 {
+        Unknown,
+        PayloadRelease, ///< The query cache's payload releases (puller, 3D, compute, copy, QMD)
+        QueryResult,    ///< A report the query cache wrote once its fence passed
+        QmdReduction,
+        QmdMax,
+        Count,
+    };
+
     static Nx2SemaphoreWaiters& Get() {
         static Nx2SemaphoreWaiters waiters;
         return waiters;
@@ -381,7 +391,7 @@ public:
     void Add(const void* owner, u64 device_address, u32 value, u32 operation) {
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
-        waiters.push_back({owner, device_address, value, operation, false});
+        waiters.push_back({owner, device_address, value, operation, false, Source::Unknown});
         count.store(waiters.size(), std::memory_order_release);
     }
 
@@ -403,8 +413,19 @@ public:
                                    [owner](const Waiter& w) { return w.owner == owner && w.latched; });
     }
 
-    /// A GPU write of `value` to the u32 at `device_address`.
-    void OnWrite(u64 device_address, u32 value) {
+    /// TEST: what latched `owner`'s waiter.
+    [[nodiscard]] Source LatchSource(const void* owner) {
+        std::scoped_lock lk{mutex};
+        for (const Waiter& w : waiters) {
+            if (w.owner == owner && w.latched) {
+                return w.source;
+            }
+        }
+        return Source::Unknown;
+    }
+
+    /// A GPU write of `value` to the u32 at `device_address` (by `source`, TEST).
+    void OnWrite(u64 device_address, u32 value, Source source = Source::Unknown) {
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -412,6 +433,7 @@ public:
         for (auto& w : waiters) {
             if (w.address == device_address && !w.latched && Matches(w, value)) {
                 w.latched = true;
+                w.source = source;
             }
         }
     }
@@ -423,6 +445,7 @@ private:
         u32 value;
         u32 operation;
         bool latched;
+        Source source;
     };
 
     static bool Matches(const Waiter& w, u32 current) {

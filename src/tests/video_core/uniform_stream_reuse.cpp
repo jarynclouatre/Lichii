@@ -19,9 +19,21 @@ void Check(bool condition, const char* message) {
 
 struct Memory {
     std::array<u8, 8192> bytes{};
+    u32 gathered{}; ///< Reads through ReadBlockUnsafe
+    u32 in_place{}; ///< Ranges GetSpan handed out
     void ReadBlockUnsafe(u64 address, void* destination, u32 size) {
         Check(address + size <= bytes.size(), "read outside guest memory");
         std::memcpy(destination, bytes.data() + address, size);
+        ++gathered;
+    }
+    /// As the device memory manager: a range in one piece of host memory, here one that doesn't
+    /// cross a 4 KiB page (as if the pages after it were mapped elsewhere).
+    u8* GetSpan(u64 address, size_t size) {
+        if (address / 4096 != (address + size - 1) / 4096) {
+            return nullptr;
+        }
+        ++in_place;
+        return bytes.data() + address;
     }
 };
 
@@ -113,4 +125,6 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
         bind(stage, slot, address, size);
         bind(stage, slot, address, size);
     }
+    Check(memory.gathered > 1000 && memory.in_place > 1000,
+          "the reads did not take both the gathered and the in-place path");
 }

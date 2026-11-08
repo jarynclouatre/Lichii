@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstddef>
+#include <span>
 #include <vector>
 
 #include "common/bit_field.h"
@@ -113,6 +114,9 @@ public:
         PackedGPUVAddr address;
         u32 payload;
     };
+    /// The methods of Regs::semaphore (address high and low, payload) and Regs::launch_dma.
+    static constexpr u32 SemaphoreMethod = 0x240 / sizeof(u32);
+    static constexpr u32 LaunchDmaMethod = 0x300 / sizeof(u32);
     static_assert(sizeof(Semaphore) == 12);
 
     struct RenderEnable {
@@ -241,6 +245,21 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// The methods of the register file (CallMethod ignores the ones past it).
+    static constexpr u32 RegisterCount = 0x800;
+    /// Guest memory [address, address + size) a launch writes (size 0: none).
+    struct WriteRange {
+        GPUVAddr address{};
+        u64 size{};
+    };
+    struct LaunchWrites {
+        WriteRange destination; ///< Every byte Launch() may write, whatever layout it picks
+        WriteRange semaphore;   ///< ReleaseSemaphore's
+    };
+    /// What a launch with register file `registers` writes (the split GPU thread's front keeps a
+    /// copy of the registers to place the copies the back makes).
+    [[nodiscard]] static LaunchWrites WritesOfLaunch(std::span<const u32, RegisterCount> registers);
+
     explicit MaxwellDMA(MemoryManager& memory_manager_);
     ~MaxwellDMA() override;
 
@@ -328,6 +347,9 @@ private:
     ASSERT_REG_POSITION(src_params, 0x728);
     ASSERT_REG_POSITION(pm_trigger_end, 0x1114);
 #undef ASSERT_REG_POSITION
+    static_assert(SemaphoreMethod * sizeof(u32) == offsetof(Regs, semaphore));
+    static_assert(LaunchDmaMethod * sizeof(u32) == offsetof(Regs, launch_dma));
+    static_assert(RegisterCount == NUM_REGS);
 };
 
 } // namespace Tegra::Engines

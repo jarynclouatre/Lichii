@@ -310,7 +310,7 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
         }
         impl->multi_dev_address.Register(new_dev, start_id);
     }
-    translation_generation.fetch_add(1, std::memory_order_release);
+    translation_generation.store(NextTranslationGeneration(), std::memory_order_release);
     if (track) {
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
@@ -346,7 +346,7 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
             base_dev = new_start | MULTI_FLAG;
         }
     }
-    translation_generation.fetch_add(1, std::memory_order_release);
+    translation_generation.store(NextTranslationGeneration(), std::memory_order_release);
 }
 
 template <typename Traits>

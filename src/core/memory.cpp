@@ -35,6 +35,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_wait_stats.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
@@ -891,6 +892,7 @@ struct Memory::Impl {
             return;
         }
         const size_t core = system.GetCurrentHostThreadID();
+        VideoCommon::GpuWaitStats::CountRasterizerRead(core);
         if (core >= Core::Hardware::NUM_CPU_CORES) {
             // A service thread has no slot in the arrays below, and it does not use a slot of a
             // core. It keeps no area, so it asks on each read.
@@ -943,6 +945,7 @@ struct Memory::Impl {
                 sys_core_guard.unlock();
             }
         };
+        VideoCommon::GpuWaitStats::CountRasterizerWrite(core);
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
@@ -952,8 +955,11 @@ struct Memory::Impl {
             // we should let the compiler just do it's thing...
             if (current_area.last_address != subaddress) {
                 // Short circuit the need to check for address/size
+                const u64 check_start = VideoCommon::GpuWaitStats::Now();
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);
+                VideoCommon::GpuWaitStats::AddWriteCheck(core, VideoCommon::GpuWaitStats::Now() -
+                                                                   check_start);
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {
@@ -961,6 +967,9 @@ struct Memory::Impl {
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
+            // A download writing to guest memory here may have looked at the collected writes
+            // before this one: its bytes would land over the ones stored after this returns.
+            VideoCore::DownloadLanding::Await(address, size);
         });
     }
 

@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -34,12 +35,15 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
+#include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
+#include "video_core/gpu_wait_stats.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_read_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -111,17 +115,37 @@ struct GPU::Impl {
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
         std::vector<std::pair<DAddr, u64>> writes;
-        std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
-        system.GatherGPUDirtyMemory(callback_writes);
-        if (!writes.empty()) {
-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+        {
+            // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
+            // download written to guest memory meanwhile on another thread (FinishRead) would
+            // otherwise write the GPU's older bytes over them.
+            std::scoped_lock lock{applying_writes_mutex};
+            std::function<void(PAddr, size_t)> callback_writes(
+                [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+            system.GatherGPUDirtyMemory(callback_writes);
+            if (writes.empty()) {
+                return;
+            }
+            applying_writes.push_back(&writes);
         }
+        // Also if OnCacheInvalidations throws: ForEachPendingCpuWrite must not reach `writes`
+        // once it is gone.
+        SCOPE_EXIT {
+            std::scoped_lock lock{applying_writes_mutex};
+            std::erase(applying_writes, &writes);
+        };
+        renderer->ReadRasterizer()->OnCacheInvalidations(writes);
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        std::scoped_lock lock{applying_writes_mutex};
         for (auto& manager : system.GetGPUDirtyMemoryManager()) {
             manager.ForEachPending(callback);
+        }
+        for (const auto* writes : applying_writes) {
+            for (const auto& [address, size] : *writes) {
+                callback(address, size);
+            }
         }
     }
 
@@ -135,7 +159,8 @@ struct GPU::Impl {
     template <typename Func>
     [[nodiscard]] u64 RequestSyncOperation(Func&& action) {
         std::unique_lock lck{sync_request_mutex};
-        const u64 fence = ++last_sync_fence;
+        const u64 fence = last_sync_fence.load(std::memory_order_relaxed) + 1;
+        last_sync_fence.store(fence, std::memory_order_release);
         sync_requests.emplace_back(std::forward<Func>(action));
         return fence;
     }
@@ -145,19 +170,32 @@ struct GPU::Impl {
         return current_sync_fence.load(std::memory_order_relaxed);
     }
 
+    /// Returns once the request of `fence` ran, or once the GPU threads stopped for good
+    /// (NotifyShutdown): then it never runs.
     void WaitForSyncOperation(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
+        sync_request_cv.wait(lck, [this, fence] {
+            return CurrentSyncRequestFence() >= fence || sync_requests_dropped;
+        });
     }
 
     void WaitForIdle() {
+        const u64 request = VideoCommon::GpuWaitStats::Now();
         const u64 fence = RequestSyncOperation([] {});
         gpu_thread.TickGPU(is_async);
         WaitForSyncOperation(fence);
+        VideoCommon::GpuWaitStats::RecordSync(VideoCommon::GpuWaitStats::Site::Idle,
+                                              VideoCommon::GpuWaitStats::Now() - request);
     }
 
     /// Tick pending requests within the GPU.
     void TickWork() {
+        // After every draw and dispatch, nearly always with nothing to do: every request made
+        // has run. One made meanwhile runs at the next tick, which its maker asks for.
+        if (current_sync_fence.load(std::memory_order_acquire) ==
+            last_sync_fence.load(std::memory_order_acquire)) {
+            return;
+        }
         std::unique_lock lck{sync_request_mutex};
         while (!sync_requests.empty()) {
             auto request = std::move(sync_requests.front());
@@ -190,11 +228,27 @@ struct GPU::Impl {
     /// core timing events.
     void Start() {
         Settings::UpdateGPUAccuracy();
+        // With the GPU thread split, its back runs a sync operation a guest thread waits for as
+        // soon as it asks (OnCPURead).
+        VideoCommon::GpuSplit::Get().SetTickHook(
+            [](void* argument) { static_cast<Impl*>(argument)->TickWork(); }, this);
         gpu_thread.StartThread(*renderer, renderer->Context(), scheduler);
     }
 
     void NotifyShutdown() {
         gpu_thread.NotifyShutdown();
+        VideoCommon::GpuSplit::Get().SetTickHook(nullptr, nullptr);
+        {
+            // The GPU threads stopped: no sync operation runs anymore. Guest threads still run
+            // until the kernel suspends them, and one waiting for a read's flush (OnCPURead)
+            // would wait forever, in host code where the kernel cannot suspend it
+            // (KernelCore::SuspendEmulation then waits for it forever). Drop the requests, which
+            // may refer to their waiters' frames, and release the waiters.
+            std::scoped_lock requests_lock{sync_request_mutex};
+            sync_requests.clear();
+            sync_requests_dropped = true;
+        }
+        sync_request_cv.notify_all();
         std::unique_lock lk{sync_mutex};
         shutting_down.store(true, std::memory_order::relaxed);
         sync_cv.notify_all();
@@ -242,7 +296,12 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        namespace Stats = VideoCommon::GpuWaitStats;
+        const size_t core = system.GetCurrentHostThreadID();
+        const u64 check_start = Stats::Now();
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        const u64 request = Stats::Now();
+        Stats::AddAreaCheck(core, request - check_start);
         if (raster_area.preemtive) {
             return raster_area;
         }
@@ -254,13 +313,63 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
-        const u64 fence = RequestSyncOperation([this, raster_area]() {
-            // Apply collected guest writes before downloading GPU data over guest memory.
-            InvalidateGPUCache();
-            renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
-        });
-        gpu_thread.TickGPU(is_async);
-        WaitForSyncOperation(fence);
+        // Filled on the GPU thread while this thread waits for it.
+        Stats::FlushTiming timing{};
+        // TEST (EDEN_NX2_READ_TRACE): this read on the host GPU's timeline.
+        namespace ReadTrace = VideoCommon::ReadTrace;
+        const bool traced = ReadTrace::Enabled();
+        ReadTrace::Read trace{};
+        if (traced) [[unlikely]] {
+            trace.area = raster_area.start_address;
+            trace.in_flight = raster_area.in_flight;
+            trace.request = request;
+            renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Request);
+        }
+        // In flight: an earlier read's downloads cover the area, only FinishRead is left.
+        if (!raster_area.in_flight) {
+            const u64 fence = RequestSyncOperation([this, raster_area, &timing]() {
+                timing.start = Stats::Now();
+                const Stats::HostWaits host_before = Stats::t_host_waits;
+                const u64 bytes_before = Stats::t_download_bytes;
+                // Apply collected guest writes before downloading GPU data over guest memory.
+                InvalidateGPUCache();
+                timing.applied = Stats::Now();
+                renderer->ReadRasterizer()->FlushRegionForRead(
+                    raster_area.start_address, raster_area.end_address - raster_area.start_address);
+                timing.host_ns = Stats::t_host_waits.ns - host_before.ns;
+                timing.finishes = Stats::t_host_waits.count - host_before.count;
+                timing.bytes = Stats::t_download_bytes - bytes_before;
+                timing.end = Stats::Now();
+            });
+            // The split's back runs it after the entry it is on. The tick sent through the GPU
+            // thread's queue still runs it without the split.
+            VideoCommon::GpuSplit::Get().RequestTick();
+            gpu_thread.TickGPU(is_async);
+            if (traced) [[unlikely]] {
+                // While the GPU thread runs the flush.
+                renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Calibrate);
+            }
+            WaitForSyncOperation(fence);
+        } else if (traced) [[unlikely]] {
+            renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Calibrate);
+        }
+        // The GPU thread submitted the downloads without waiting for the host GPU: this thread
+        // waits for them and writes them to guest memory, while the GPU thread goes on.
+        const u64 finish_start = Stats::Now();
+        if (traced) [[unlikely]] {
+            ReadTrace::t_read = &trace;
+        }
+        renderer->ReadRasterizer()->FinishRead(raster_area.start_address,
+                                               raster_area.end_address - raster_area.start_address);
+        const u64 woke = Stats::Now();
+        if (traced) [[unlikely]] {
+            ReadTrace::t_read = nullptr;
+            trace.landed = woke;
+            renderer->ReadRasterizer()->TraceRead(trace, ReadTrace::Step::Done);
+        }
+        timing.finish_ns = woke - finish_start;
+        timing.in_flight = raster_area.in_flight;
+        Stats::RecordReactive(raster_area, core, request, timing, woke);
         return raster_area;
     }
 
@@ -269,12 +378,15 @@ struct GPU::Impl {
         if (preserve_gpu_writes) {
             VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
             if (!rasterizer->TryCacheInvalidation(addr, size)) {
+                const u64 request = VideoCommon::GpuWaitStats::Now();
                 const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
                     rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
                     rasterizer->OnCacheInvalidation(addr, size);
                 });
                 gpu_thread.TickGPU(is_async);
                 WaitForSyncOperation(fence);
+                VideoCommon::GpuWaitStats::RecordSync(VideoCommon::GpuWaitStats::Site::Invalidate,
+                                                      VideoCommon::GpuWaitStats::Now() - request);
             }
             return;
         }
@@ -380,11 +492,17 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     std::atomic<AmpereAnchor> ampere_anchor{};
-    u64 last_sync_fence{};
+    std::atomic<u64> last_sync_fence{}; ///< The last request's fence (written under the mutex)
 
     VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
+    /// The GPU threads stopped and the requests were dropped (NotifyShutdown, under the mutex).
+    bool sync_requests_dropped{};
+
+    /// InvalidateGPUCache: the writes it gathered and is applying, on each thread doing so.
+    std::vector<const std::vector<std::pair<DAddr, u64>>*> applying_writes;
+    std::mutex applying_writes_mutex;
 
     const bool is_async;
 

@@ -31,6 +31,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/gpu_wait_stats.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/oot_dlss.h"
@@ -1331,6 +1332,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         auto copies = FullDownloadCopies(image.info);
         image.DownloadMemory(map, copies);
         pending_bytes += image.unswizzled_size_bytes;
+        GpuWaitStats::AddDownloadBytes(image.unswizzled_size_bytes);
         pending.push_back(Pending{image_id, map, std::move(copies)});
     }
     flush_pending();

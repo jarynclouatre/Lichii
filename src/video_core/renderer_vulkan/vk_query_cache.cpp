@@ -1419,6 +1419,9 @@ struct QueryCacheRuntimeImpl {
     VkConditionalRenderingBeginInfoEXT hcr_setup;
     VkBuffer hcr_buffer;
     size_t hcr_offset;
+    /// The guest bytes hcr_setup reads when they are a guest buffer's, 0 when it reads the
+    /// resolve buffer. Each resume reads them again, in the submission it is recorded in.
+    DAddr hcr_guest_address{};
     bool hcr_is_set;
     bool is_hcr_running;
 
@@ -1449,6 +1452,7 @@ void QueryCacheRuntime::EndHostConditionalRendering() {
     impl->is_hcr_running = false;
     impl->hcr_buffer = VkBuffer{};
     impl->hcr_offset = 0;
+    impl->hcr_guest_address = 0;
 }
 
 void QueryCacheRuntime::PauseHostConditionalRendering() {
@@ -1467,6 +1471,11 @@ void QueryCacheRuntime::ResumeHostConditionalRendering() {
         return;
     }
     if (!impl->is_hcr_running) {
+        if (impl->hcr_guest_address != 0) {
+            // An upload of the predicate later in this submission must run after this read.
+            std::scoped_lock lk(impl->buffer_cache.mutex);
+            impl->buffer_cache.MarkUsed(impl->hcr_guest_address, 8);
+        }
         impl->scheduler.Record([hcr_setup = impl->hcr_setup](vk::CommandBuffer cmdbuf) {
             cmdbuf.BeginConditionalRenderingEXT(hcr_setup);
         });
@@ -1497,6 +1506,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareValueImpl(VideoCommon::Lo
     }
     impl->hcr_setup.buffer = impl->hcr_buffer;
     impl->hcr_setup.offset = impl->hcr_offset;
+    impl->hcr_guest_address = object.address;
     impl->hcr_setup.flags = is_equal ? VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT : 0;
     impl->hcr_is_set = true;
     impl->is_hcr_running = false;
@@ -1526,6 +1536,7 @@ void QueryCacheRuntime::HostConditionalRenderingCompareBCImpl(DAddr address, boo
     impl->conditional_resolve_pass->Resolve(*impl->hcr_resolve_buffer, to_resolve,
                                             to_resolve_offset, compare_to_zero);
     impl->hcr_setup.buffer = *impl->hcr_resolve_buffer;
+    impl->hcr_guest_address = 0;
     impl->hcr_setup.offset = 0;
     impl->hcr_setup.flags = is_equal ? 0 : VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
     impl->hcr_is_set = true;
@@ -1747,6 +1758,11 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
             impl->buffers_to_upload_to.emplace_back(buffer->Handle(), offset);
         }
     });
+    // The copies below are GPU writes the buffer cache doesn't record: reads taken before them
+    // must not keep the bytes they downloaded as the newest.
+    for (const auto& value : values) {
+        impl->buffer_cache.OutdateReadDownloads(value.address, value.size);
+    }
 
     VkBuffer src_buffer;
     [[maybe_unused]] StagingBufferRef ref;

@@ -51,6 +51,10 @@ public:
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+    /// No query cache: Query writes each report as it is made.
+    bool HoldsQueries([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size) override {
+        return false;
+    }
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;

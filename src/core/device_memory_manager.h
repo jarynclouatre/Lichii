@@ -251,7 +251,15 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
-    std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
+    /// Generations come from one counter shared by every manager. A thread's translations name
+    /// their manager by address, and a manager made where a destroyed one was (a test fixture
+    /// on the stack, a System made again in the same process) would otherwise start with the
+    /// same generation and take the old manager's host pointers for its own.
+    static u64 NextTranslationGeneration() {
+        static std::atomic<u64> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::atomic<u64> translation_generation{NextTranslationGeneration()}; ///< New at Map and Unmap
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);

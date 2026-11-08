@@ -43,6 +43,23 @@ inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
     return false;
 }
 
+/// Whether the query cache holds reports that can still land in [source, source + size): a read
+/// sees them only once FlushPending wrote them out. Any thread (RasterizerInterface::HoldsQueries).
+inline bool HoldsReports(const Tegra::MemoryManager& memory,
+                         VideoCore::RasterizerInterface& rasterizer, GPUVAddr source, size_t size) {
+    constexpr GPUVAddr page_size = 0x1000;
+    const GPUVAddr end = source + size;
+    for (GPUVAddr begin = source; begin < end;) {
+        const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
+        if (const auto device = memory.GpuToCpuAddress(begin);
+            device && rasterizer.HoldsQueries(*device, page_end - begin)) {
+            return true;
+        }
+        begin = page_end;
+    }
+    return false;
+}
+
 /// Writes the reports in [source, source + size) to guest memory, waiting for pending host
 /// results. Runs where the rasterizer's caches are owned.
 inline void FlushPending(const Tegra::MemoryManager& memory,

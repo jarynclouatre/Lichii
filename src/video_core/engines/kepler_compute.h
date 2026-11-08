@@ -37,6 +37,10 @@ namespace Tegra {
 class MemoryManager;
 }
 
+namespace Tegra::Nx2ListIndirect {
+class ComputeFront;
+}
+
 namespace VideoCore {
 class RasterizerInterface;
 }
@@ -251,6 +255,12 @@ public:
         return indirect_compute;
     }
 
+    /// The slot of GPU-written list words (Nx2ListIndirect) the dispatch being made takes its
+    /// group counts from, indirectly: its QMD's grid is the slot's placeholders.
+    std::optional<u32> GetIndirectListSlot() const {
+        return indirect_list_slot;
+    }
+
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
     /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
@@ -280,12 +290,22 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
+    /// The front, at a GPU-written list of `count` words that are all the parameters of the call
+    /// of macro method `method` about to start: whether the call takes the words as the
+    /// placeholders of `slot` (Nx2ListIndirect), the back's copy of them, instead of the words.
+    bool FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count, u32 slot);
 
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
     void ReleaseFront();
     void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& state, u32 method,
+                         u32 argument, bool from_macro);
+    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state, u32 control,
+                         bool from_macro);
+    void FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& state, u32 last_word);
+    void FrontQmdCheck(VideoCommon::GpuSplit& split); ///< TEST
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
@@ -397,6 +417,9 @@ private:
     };
     std::vector<UploadInfo> uploads;
     std::optional<GPUVAddr> indirect_compute{};
+    std::optional<u32> indirect_list_slot{};
+    /// The front's GPU-written list words in this engine's macros (Nx2ListIndirect).
+    std::unique_ptr<Nx2ListIndirect::ComputeFront> list_front;
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

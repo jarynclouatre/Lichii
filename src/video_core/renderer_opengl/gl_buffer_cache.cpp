@@ -188,7 +188,7 @@ void BufferCacheRuntime::CopyBuffer(GLuint dst_buffer, Buffer& src_buffer,
 
 void BufferCacheRuntime::CopyBuffer(Buffer& dst_buffer, GLuint src_buffer,
                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
-                                    bool) {
+                                    VideoCommon::UploadOrder) {
     CopyBuffer(dst_buffer.Handle(), src_buffer, copies, barrier);
 }
 

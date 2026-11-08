@@ -4,7 +4,9 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -148,4 +150,142 @@ TEST_CASE("Semaphore reductions follow the documented ops", "[video_core][native
     REQUIRE(ReduceSemaphore(5, false, 0b1100, 0b1010) == 0b1000);
     REQUIRE(ReduceSemaphore(6, false, 0b1100, 0b1010) == 0b1110);
     REQUIRE(ReduceSemaphore(7, false, 0b1100, 0b1010) == 0b0110);
+}
+
+TEST_CASE("A QMD scheduler with a table of its own schedules apart from the shared one",
+          "[video_core][native_qmd]") {
+    constexpr Address address = 0x40000;
+    auto qmd = MakeQmd();
+    qmd[4] = 1U << 14; // One dependency
+    SetRelease(qmd, 24, 0x5000, Enable | OneWord, 1);
+    const std::map<Address, Descriptor> memory{{address, qmd}};
+    const auto signal = [&](NativeQmdScheduler& scheduler, Word action) {
+        std::vector<Released> released;
+        const auto error = scheduler.Signal(
+            address, action,
+            [&](Address qmd_address, Descriptor& descriptor) {
+                const auto it = memory.find(qmd_address);
+                if (it == memory.end()) {
+                    return false;
+                }
+                descriptor = it->second;
+                return true;
+            },
+            [&](Address destination, Word payload, Word flags) {
+                released.push_back({destination, payload, flags});
+                return true;
+            });
+        REQUIRE(error.empty());
+        return released;
+    };
+    const std::vector<Released> run{{0x5000, 1, Enable | OneWord}};
+    // Loaded on the shared table, it waits for its dependency.
+    NativeQmdScheduler shared;
+    REQUIRE(signal(shared, 3).empty());
+    // A copy of the table runs it at the decrement as the shared one does, and apart from it.
+    NativeQmdScheduler own{NativeQmdScheduler::OwnTable{}};
+    own.CopyStates(shared);
+    REQUIRE(signal(own, 7) == run);
+    REQUIRE(signal(own, 7).empty()); // Completed: a decrement is kept for its next load
+    REQUIRE(signal(shared, 7) == run);
+    // A table that never saw the load keeps the decrement for it.
+    NativeQmdScheduler other{NativeQmdScheduler::OwnTable{}};
+    REQUIRE(signal(other, 7).empty());
+    REQUIRE(signal(other, 3) == run);
+}
+
+TEST_CASE("A QMD scheduler takes back what an attempt changed and keeps what one committed",
+          "[video_core][native_qmd]") {
+    constexpr Address first = 0x40000;
+    constexpr Address second = 0x40100;
+    auto waiting = MakeQmd();
+    waiting[4] = 1U << 14; // One dependency
+    SetRelease(waiting, 24, 0x5000, Enable | OneWord, 1);
+    auto chained = MakeQmd(); // Decrements `first` when it runs
+    SetRelease(chained, 24, 0x5004, Enable | OneWord, 2);
+    chained[15] = static_cast<Word>(first >> 8);
+    chained[16] = 1 | (4U << 1);
+    std::map<Address, Descriptor> memory{{first, waiting}, {second, chained}};
+    bool unreadable{};
+    const auto signal = [&](NativeQmdScheduler& scheduler, Address address, Word action) {
+        std::vector<Released> released;
+        const auto error = scheduler.Signal(
+            address, action,
+            [&](Address qmd_address, Descriptor& descriptor) {
+                const auto it = memory.find(qmd_address);
+                if (it == memory.end() || (unreadable && qmd_address == first)) {
+                    return false;
+                }
+                descriptor = it->second;
+                return true;
+            },
+            [&](Address destination, Word payload, Word flags) {
+                released.push_back({destination, payload, flags});
+                return true;
+            });
+        return std::make_pair(std::string{error}, released);
+    };
+    NativeQmdScheduler own{NativeQmdScheduler::OwnTable{}};
+    NativeQmdScheduler reference{NativeQmdScheduler::OwnTable{}};
+    REQUIRE(signal(own, first, 3).second.empty()); // Loaded, waits for its dependency
+    REQUIRE(signal(reference, first, 3).second.empty());
+    // The chained launch runs and decrements `first`, which can't be read: taken back, the table
+    // is as before, `second` never ran.
+    unreadable = true;
+    own.BeginAttempt();
+    REQUIRE_FALSE(signal(own, second, 3).first.empty());
+    own.RollbackAttempt();
+    REQUIRE(own.SameStates(reference));
+    REQUIRE(own.StateCount() == 1);
+    // Tried again once it can be read: both run, as on a table that never tried.
+    unreadable = false;
+    own.BeginAttempt();
+    const auto ran = signal(own, second, 3);
+    own.CommitAttempt();
+    const std::vector<Released> both{{0x5004, 2, Enable | OneWord}, {0x5000, 1, Enable | OneWord}};
+    REQUIRE(ran.first.empty());
+    REQUIRE(ran.second == both);
+    REQUIRE(signal(reference, second, 3).second == both);
+    REQUIRE(own.SameStates(reference));
+    // A rollback after the commit changes nothing.
+    own.RollbackAttempt();
+    REQUIRE(own.SameStates(reference));
+}
+
+TEST_CASE("A QMD scheduler takes back the history an attempt dropped at its limit",
+          "[video_core][native_qmd]") {
+    // Any address holds a QMD that runs at once; one of them can't be read.
+    const Descriptor qmd = MakeQmd();
+    Address unreadable = 0;
+    const auto signal = [&](NativeQmdScheduler& scheduler, Address address) {
+        return std::string{scheduler.Signal(
+            address, 3,
+            [&](Address qmd_address, Descriptor& descriptor) {
+                descriptor = qmd;
+                return qmd_address != unreadable;
+            },
+            [](Address, Word, Word) { return true; })};
+    };
+    NativeQmdScheduler own{NativeQmdScheduler::OwnTable{}};
+    NativeQmdScheduler reference{NativeQmdScheduler::OwnTable{}};
+    for (Address i = 0; i < 4096; ++i) {
+        REQUIRE(signal(own, 0x100000 + i * 0x100).empty());
+        REQUIRE(signal(reference, 0x100000 + i * 0x100).empty());
+    }
+    REQUIRE(own.StateCount() == 4096);
+    // A new QMD past the limit drops the finished ones first; it can't be read: all taken back.
+    unreadable = 0x900000;
+    own.BeginAttempt();
+    REQUIRE_FALSE(signal(own, unreadable).empty());
+    own.RollbackAttempt();
+    REQUIRE(own.StateCount() == 4096);
+    REQUIRE(own.SameStates(reference));
+    // Kept, it drops them as the reference does.
+    unreadable = 0;
+    own.BeginAttempt();
+    REQUIRE(signal(own, 0x900000).empty());
+    own.CommitAttempt();
+    REQUIRE(signal(reference, 0x900000).empty());
+    REQUIRE(own.StateCount() == 1);
+    REQUIRE(own.SameStates(reference));
 }

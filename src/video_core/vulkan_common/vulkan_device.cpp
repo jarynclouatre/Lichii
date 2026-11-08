@@ -27,6 +27,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_read_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1241,6 +1242,15 @@ bool Device::GetSuitability(bool requires_swapchain) {
         loaded_extensions.insert(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     } else {
         graphics_pipeline_library_requested = false;
+    }
+
+    // TEST (EDEN_NX2_READ_TRACE): the device's clock, read from the host (Scheduler::TraceRead).
+    if (VideoCommon::ReadTrace::Enabled()) {
+        if (supported_extensions.contains(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        } else if (supported_extensions.contains(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        }
     }
 
     extensions.depth_stencil_resolve =

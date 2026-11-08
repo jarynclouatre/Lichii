@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <bitset>
 #include <memory>
 #include "video_core/macro_memo.h"
 #include "video_core/macro_turing.h"
@@ -265,7 +266,13 @@ struct MacroEngine {
     std::shared_ptr<TuringMacroJit> native_jit;
     MacroMemoPairs native_writes;
     u64 native_calls{};
-
+    /// Set while the split GPU thread's back runs a call in its front's place (Maxwell3D::
+    /// FrontRunOnBack): the 3D registers the call can write. Such a call uses no data RAM; its
+    /// writes to other registers are counted in split_unexpected_writes.
+    const std::bitset<0xe00>* split_writes{};
+    u64 split_unexpected_writes{};
+    /// EDEN_NX2_BACK_MACRO_VERIFY: where such a call records its writes (method, value).
+    std::vector<std::pair<u32, u32>>* split_record{};
 };
 
 struct NativeMacroContext {

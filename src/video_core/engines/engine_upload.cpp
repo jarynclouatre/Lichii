@@ -16,6 +16,32 @@
 
 namespace Tegra::Engines::Upload {
 
+namespace {
+
+/// The power of two bytes a swizzled upload moves per element (ProcessData).
+u32 SwizzleBppShift(const Registers& regs) {
+    return Common::FoldRight(
+        4U, [](u32 x, u32 y) { return (std::min)(x, static_cast<u32>(std::countr_zero(y))); },
+        regs.dest.width, regs.line_length_in, regs.dest.x, static_cast<u32>(regs.dest.Address()));
+}
+
+} // Anonymous namespace
+
+WrittenRange UploadedRange(const Registers& regs, bool is_linear) {
+    const GPUVAddr address = regs.dest.Address();
+    if (is_linear) {
+        if (regs.line_count == 0 || regs.line_length_in == 0) {
+            return {};
+        }
+        // The last line ends last, whatever the pitch.
+        return {address, u64{regs.dest.pitch} * (regs.line_count - 1) + regs.line_length_in};
+    }
+    const u32 bpp_shift = SwizzleBppShift(regs);
+    return {address, Tegra::Texture::CalculateSize(
+                         true, 1U << bpp_shift, regs.dest.width >> bpp_shift, regs.dest.height,
+                         regs.dest.depth, regs.dest.BlockHeight(), regs.dest.BlockDepth())};
+}
+
 State::State(MemoryManager& memory_manager_, Registers& regs_)
     : regs{regs_}, memory_manager{memory_manager_} {}
 
@@ -77,15 +103,11 @@ void State::ProcessData(std::span<const u8> read_buffer) {
             rasterizer->AccelerateInlineToMemory(dest_line, regs.line_length_in, buffer);
         }
     } else {
-        u32 width = regs.dest.width;
-        u32 x_elements = regs.line_length_in;
-        u32 x_offset = regs.dest.x;
-        const u32 bpp_shift = Common::FoldRight(
-            4U, [](u32 x, u32 y) { return (std::min)(x, static_cast<u32>(std::countr_zero(y))); },
-            width, x_elements, x_offset, static_cast<u32>(address));
-        width >>= bpp_shift;
-        x_elements >>= bpp_shift;
-        x_offset >>= bpp_shift;
+        // As UploadedRange places it.
+        const u32 bpp_shift = SwizzleBppShift(regs);
+        const u32 width = regs.dest.width >> bpp_shift;
+        const u32 x_elements = regs.line_length_in >> bpp_shift;
+        const u32 x_offset = regs.dest.x >> bpp_shift;
         const u32 bytes_per_pixel = 1U << bpp_shift;
         const std::size_t dst_size = Tegra::Texture::CalculateSize(
             true, bytes_per_pixel, width, regs.dest.height, regs.dest.depth,

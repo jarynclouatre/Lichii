@@ -18,13 +18,18 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/fire_emblem_upscale.h"
+#include "video_core/front_qmd.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_drain_check.h"
+#include "video_core/nx2_list_indirect.h"
+#include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -79,7 +84,11 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     }
 }
 
-KeplerCompute::~KeplerCompute() = default;
+KeplerCompute::~KeplerCompute() {
+    if (native_data_ram != nullptr) {
+        Nx2ListIndirect::ForgetChannel(native_data_ram);
+    }
+}
 
 void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -308,6 +317,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         }
         rasterizer->AccelerateInlineToMemory(address, 256,
             std::span<const u8>{reinterpret_cast<const u8*>(native_registers.data() + 0xc8), 256});
+        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+            // The slots the grid's list word placeholders name stay for its launches.
+            rasterizer->Nx2NoteInlineQmdGrid(*device, native_registers[0xc8 + 12],
+                                             native_registers[0xc8 + 13],
+                                             native_registers[0xc8 + 14]);
+        }
         if ((control & (1U << 24)) || !(native_registers[0xcc] & (1U << 12))) {
             const u32 previous = native_registers[0xad];
             native_registers[0xad] = static_cast<u32>(address >> 8);
@@ -349,6 +364,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
+                if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
+                    // TEST: what the front's QMD view compares the descriptors it read with.
+                    VideoCommon::Nx2DrainCheck::NoteQmdRead(address, descriptor,
+                                                            VideoCommon::GpuSplit::OnBackThread());
+                }
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
                     LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
@@ -369,13 +389,24 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                // TEST (EDEN_NX2_DRAIN_CHECK): what the front's QMD view compares its notes with.
+                const auto checked = [this, address](u32 offset, u32 value) {
+                    if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
+                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                            VideoCommon::Nx2DrainCheck::NoteQmdRelease(
+                                *device + offset, value, VideoCommon::GpuSplit::OnBackThread());
+                        }
+                    }
+                };
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload, flags] {
+                    rasterizer->SignalFence([this, address, payload, flags, checked] {
                         const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
                                                           memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
+                        checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
+                                *device, value, Tegra::Nx2SemaphoreWaiters::Source::QmdReduction);
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -391,15 +422,19 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::HasTimeout,
                         payload, 0);
+                    checked(0, payload);
+                    checked(4, 0);
                 } else if (flags & (1U << 19)) {
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
+                    rasterizer->SignalFence([this, address, payload, checked] {
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
+                        checked(0, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
+                                *device, value, Tegra::Nx2SemaphoreWaiters::Source::QmdMax);
                         }
                     });
                 } else {
@@ -412,9 +447,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     }
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
+                    checked(0, payload);
                 }
                 return true;
             }, [&](const auto& descriptor) { return DispatchNativeCompute(descriptor); });
+        if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
+            // TEST: where this signal's reads end, for the front's QMD view check.
+            VideoCommon::Nx2DrainCheck::NoteQmdSignalEnd(VideoCommon::GpuSplit::OnBackThread());
+        }
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
             return true;
@@ -534,7 +574,38 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
     }
 }
 
-bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
+bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor) {
+    // A grid of GPU-written list words (Nx2ListIndirect): one slot's three words, which the host
+    // GPU dispatches from, or placeholders of several, whose words the back reads.
+    NativeQmdScheduler::Descriptor resolved;
+    const bool listed = Nx2ListIndirect::IsPlaceholder(descriptor[12]) ||
+                        Nx2ListIndirect::IsPlaceholder(descriptor[13]) ||
+                        Nx2ListIndirect::IsPlaceholder(descriptor[14]);
+    if (listed) [[unlikely]] {
+        indirect_list_slot =
+            Nx2ListIndirect::GridSlot(descriptor[12], descriptor[13], descriptor[14]);
+        if (!indirect_list_slot) {
+            resolved = descriptor;
+            for (const u32 word : {12U, 13U, 14U}) {
+                if (Nx2ListIndirect::IsPlaceholder(resolved[word])) {
+                    const u32 slot = Nx2ListIndirect::PlaceholderSlot(resolved[word]);
+                    std::array<u32, Nx2ListIndirect::SlotWords> words{};
+                    rasterizer->Nx2ReadListSlots(std::span<const u32>{&slot, 1}, words);
+                    Nx2ListIndirect::Stats::Count(Nx2ListIndirect::Stats::Get().grids_read);
+                    resolved[word] = words[Nx2ListIndirect::PlaceholderWord(resolved[word])];
+                }
+            }
+            // An empty grid dispatches nothing (NativeQmdScheduler::Signal does not call this).
+            if (!(resolved[12] && (resolved[13] & 0xffff) && (resolved[14] & 0xffff))) {
+                return true;
+            }
+        }
+    }
+    SCOPE_EXIT {
+        indirect_list_slot.reset();
+    };
+    const NativeQmdScheduler::Descriptor& qmd =
+        listed && !indirect_list_slot ? resolved : descriptor;
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
@@ -1677,9 +1748,157 @@ Texture::TSCEntry KeplerCompute::GetTSCEntry(u32 tsc_index) const {
     return tsc_entry;
 }
 
+namespace {
+
+// The QMD scheduling of every channel, run on the front as the back will run it.
+VideoCommon::FrontQmdView& GetFrontQmd() {
+    return VideoCommon::FrontQmdView::Get();
+}
+
+// An engine's GPU address space as its back reads QMDs and their release words (FrontQmdView).
+struct FrontQmdMemory {
+    const MemoryManager& memory;
+
+    [[nodiscard]] bool IsMapped(GPUVAddr address, u64 size) const {
+        return memory.IsFullyMappedRange(address, size);
+    }
+    void Read(GPUVAddr address, void* data, u64 size) const {
+        memory.ReadBlockUnsafe(address, data, size);
+    }
+    [[nodiscard]] u32 ReadWord(GPUVAddr address) const {
+        return memory.Read<u32>(address);
+    }
+    [[nodiscard]] bool InSyncpointShim(GPUVAddr address, u64 size) const {
+        return memory.OverlapsSyncpointShim(address, size);
+    }
+    [[nodiscard]] std::optional<u64> Device(GPUVAddr address) const {
+        return memory.GpuToCpuAddress(address);
+    }
+    [[nodiscard]] bool GpuWritten(u64 device, u64 size) const {
+        return Tegra::Nx2MayBeGpuWritten(device, size);
+    }
+    [[nodiscard]] u64 WritesTarget(const VideoCommon::GpuSplit& split, GPUVAddr address,
+                                   u64 size) const {
+        return split.MemoryWritesTarget(memory, address, size);
+    }
+    void NoteWrite(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size) const {
+        split.NoteWrite(memory, address, size);
+    }
+    void NoteWriteAt(VideoCommon::GpuSplit& split, GPUVAddr address, u64 size, u64 position) const {
+        split.NoteWriteAt(memory, address, size, position);
+    }
+    [[nodiscard]] const void* Id() const {
+        return &memory;
+    }
+};
+
+// The QMD methods: PCAS (0xae-0xb0) and the inline QMD's last word (0x107).
+[[nodiscard]] bool IsQmdMethod(u32 method) {
+    return method == 0xae || method == 0xaf || method == 0xb0 || method == 0x107;
+}
+
+// Methods whose notes the front takes from guest memory as the back finds it running them: the
+// QMD methods (descriptors, and the words maxima and reductions combine with) and the compute
+// report (reductions). The front holds them unpublished until it noted them.
+[[nodiscard]] bool ValuedFromMemory(u32 method) {
+    return IsQmdMethod(method) || method == 0x6c3;
+}
+
+// Whether a PCAS method signals the QMD scheduler, as ProcessNativeMethod filters them.
+[[nodiscard]] bool SignalsQmd(u32 method, u32 argument) {
+    if (method == 0xaf) {
+        return (argument & 2) != 0;
+    }
+    return method == 0xb0 && (argument & 15) != 0 && (argument & 15) != 1;
+}
+
+// What the back writes to guest memory running `method` (GpuSplit::Writes), as
+// ProcessNativeMethod runs it: below the macro methods, nothing for register writes, the macro
+// code and bindings (the front's) and the methods EDEN_NATIVE_DRAW_DIAGNOSTICS traces, and what
+// FrontNoteWrites notes for reports, inline QMDs, QMD launches and inline uploads.
+[[nodiscard]] VideoCommon::GpuSplit::Writes FrontWrites(u32 method) {
+    using Writes = VideoCommon::GpuSplit::Writes;
+    return method < 0xe00 ? Writes::Noted : Writes::Unplaced;
+}
+
+// TEST (EDEN_NX2_DRAIN_CHECK): whether QMD maximum and reduction releases land as the back runs
+// them (FenceManager::SignalFence runs its operation at once), for the QMD view check.
+[[nodiscard]] bool QmdReleasesLandAtOnce() {
+    return Settings::IsGPUFenceBehaviorDefault()
+               ? !Settings::IsGPULevelHigh()
+               : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate();
+}
+
+using QmdTakeOver = VideoCommon::Nx2AcquireStats::QmdTakeOver; // TEST
+
+// A compute macro call as Nx2ListIndirect::ComputeFront sees it (its Context).
+template <typename EmitFunc>
+struct ListCallContext {
+    std::span<const u32> code;
+    u64 generation;
+    u32 start;
+    std::vector<u32>& params;
+    std::span<u32> data_ram;
+    std::span<const u32> registers;
+    Nx2ListIndirect::UploadState upload;
+    VideoCommon::GpuSplit& split;
+    const MemoryManager& memory;
+    VideoCore::RasterizerInterface* rasterizer;
+    EngineInterface* engine;
+    std::array<u32, 0x1000>& front_registers;
+    std::array<u32, 0x1000>& engine_registers; ///< Set directly once the split stopped
+    const EmitFunc& emit;
+
+    [[nodiscard]] std::optional<u64> DeviceWord(u64 gpu_address) const {
+        if (!split.Ran(split.LastMappingChange())) {
+            return std::nullopt; // The back may find other mappings
+        }
+        const auto first = memory.GpuToCpuAddress(gpu_address);
+        const auto last = memory.GpuToCpuAddress(gpu_address + 3);
+        if (!first || !last || *last != *first + 3) {
+            return std::nullopt;
+        }
+        return u64{*first};
+    }
+    void Emit(u32 method, u32 value) const {
+        emit(method, value);
+    }
+    void SendOwed(u64 device, u32 value) const {
+        split.Defer([rasterizer_ = rasterizer, device,
+                     value] { rasterizer_->Nx2NoteOwedListWord(device, value); },
+                    VideoCommon::GpuSplit::Writes::Noted);
+    }
+    void Release(u32 slot) const {
+        Nx2ListIndirect::ReleaseSlot(split, rasterizer, slot);
+    }
+    void ReadSlots(std::span<const u32> slots, std::span<u32> words) const {
+        const u64 read_start =
+            Nx2ListIndirect::Stats::Enabled() ? Nx2ListIndirect::Stats::NowNs() : 0; // TEST
+        Nx2ListIndirect::ReadSlots(split, rasterizer, slots, words);
+        if (Nx2ListIndirect::Stats::Enabled()) [[unlikely]] {
+            Nx2ListIndirect::Stats::NoteRead(slots.size(),
+                                             Nx2ListIndirect::Stats::NowNs() - read_start);
+        }
+    }
+    void SetRegister(u32 method, u32 value) const {
+        front_registers[method] = value;
+        if (method == Nx2ListIndirect::UploadData) {
+            return; // The upload's data port: only macros read it back, from the front's copy
+        }
+        if (split.Active()) {
+            split.MacroWrite(engine, method, value, VideoCommon::GpuSplit::Writes::Noted);
+        } else {
+            engine_registers[method] = value;
+        }
+    }
+};
+
+} // Anonymous namespace
+
 // Split GPU thread with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2): the front
 // runs compute macros against its own copy of the native registers (which hold the last value
-// written to each, on the back too) and loads and binds the compute macro code itself.
+// written to each, on the back too) and loads and binds the compute macro code itself. It also
+// runs the QMD scheduling ahead of the back (FrontQmdView), to tell what the launches release.
 struct KeplerCompute::FrontState {
     std::array<u32, 0x1000> registers{};
     std::optional<u32> executing_macro;
@@ -1687,6 +1906,8 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    /// The inline upload the back runs, where a word of it lands (Nx2ListIndirect).
+    Nx2ListIndirect::UploadState upload;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1703,12 +1924,38 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         front->bind_pointer = native_bind_pointer;
         front->macro = native_macro;
         front_macros = true;
+        // A new session's or a restarted split's: the QMDs the back scheduled meanwhile, in the
+        // table the engines share. The back is idle, its table the current one.
+        GetFrontQmd().TakeOver(native_qmd, QmdTakeOver::FrontStart);
     }
     return *front;
 }
 
 // As Maxwell3D::ReleaseFront: the split stopped, the engine runs its macros again.
 void KeplerCompute::ReleaseFront() {
+    if (list_front && native_data_ram != nullptr) {
+        // They run on the GPU-written list words themselves from now on (Nx2ListIndirect).
+        const auto no_emit = [](u32, u32) { return false; };
+        ListCallContext<decltype(no_emit)> context{{},
+                                                   0,
+                                                   0,
+                                                   front->parameters,
+                                                   std::span<u32>{*native_data_ram},
+                                                   front->registers,
+                                                   front->upload,
+                                                   VideoCommon::GpuSplit::Get(),
+                                                   memory_manager,
+                                                   rasterizer,
+                                                   this,
+                                                   front->registers,
+                                                   native_registers,
+                                                   no_emit};
+        auto& channel = Nx2ListIndirect::GetChannel(native_data_ram);
+        if (!channel.words.empty() || !list_front->Registers().empty()) {
+            Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop); // TEST
+        }
+        list_front->ConcretizeAll(context, channel);
+    }
     native_executing_macro = front->executing_macro;
     native_parameters = std::move(front->parameters);
     native_compute_uploaded = front->compute_uploaded;
@@ -1716,6 +1963,8 @@ void KeplerCompute::ReleaseFront() {
     native_macro = front->macro;
     front.reset();
     front_macros = false;
+    // The engines schedule their QMDs on their own again.
+    GetFrontQmd().Lose();
     LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
 }
 
@@ -1724,6 +1973,8 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
     }
+    Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument,
+                                      [&fs](u32 reg) { return fs.registers[reg]; });
     fs.registers[method] = argument;
     switch (method) {
     case 0x45:
@@ -1769,7 +2020,8 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
                                     const GPUVAddr* segment) {
     auto& fs = Front(split);
     if (method >= fs.registers.size()) {
-        split.Method(this, method, argument, is_last_call, segment);
+        split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
+        split.TagUnplaced(VideoCommon::UnplacedKind::Engine); // TEST
         return;
     }
     if (method >= 0xe00) {
@@ -1787,7 +2039,162 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         return;
     }
     FrontApply(fs, method, argument);
-    split.Method(this, method, argument, is_last_call, segment);
+    if (IsQmdMethod(method)) {
+        GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
+    }
+    {
+        const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
+        split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
+        FrontNoteWrites(split, fs, method, argument, false);
+    }
+    FrontQmdCheck(split);
+}
+
+// TEST (EDEN_NX2_DRAIN_CHECK): has the back compare what it reads and releases for the QMD
+// methods just sent with what the front's QMD view read and noted for them, and now and then its
+// QMD table with the view's.
+void KeplerCompute::FrontQmdCheck(VideoCommon::GpuSplit& split) {
+    if (!VideoCommon::Nx2DrainCheck::g_enabled) [[likely]] {
+        return;
+    }
+    auto checks = GetFrontQmd().TakeChecks();
+    if (!checks) {
+        return;
+    }
+    split.DeferFunction(
+        [predicted = std::move(checks->releases), reads = std::move(checks->reads),
+         table = std::move(checks->table), valued = checks->valued && QmdReleasesLandAtOnce(),
+         after_late = checks->table_after_late, wait_position = checks->wait_position,
+         first_waiting = checks->first_waiting, late = std::move(checks->late)] {
+            VideoCommon::Nx2DrainCheck::CheckQmdReleases(predicted, reads, valued, wait_position,
+                                                         first_waiting);
+            VideoCommon::Nx2DrainCheck::CheckLateQmdReads(late);
+            if (table && valued) {
+                const NativeQmdScheduler shared; // The table the engines share
+                VideoCommon::Nx2DrainCheck::NoteQmdTables(table->SameStates(shared),
+                                                          table->StateCount(), after_late);
+            }
+        },
+        VideoCommon::GpuSplit::Writes::Noted);
+}
+
+// What the back writes to guest memory running `method` with `argument`, just sent as
+// FrontWrites tells: where reports and inline QMDs write, and what QMD launches release.
+void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontState& fs, u32 method,
+                                    u32 argument, bool from_macro) {
+    switch (method) {
+    case 0x6c3: {
+        // ProcessNativeReportSemaphore: a payload with its timestamp at most.
+        const GPUVAddr address =
+            (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        split.NoteWrite(memory_manager, address, 16);
+        FrontNoteReport(split, fs, argument, from_macro);
+        break;
+    }
+    case 0x107:
+        FrontInlineQmd(split, fs, argument);
+        break;
+    case KEPLER_COMPUTE_REG_INDEX(data_upload): {
+        // Upload::State::ProcessData, of the upload exec_upload started: the whole of it at each
+        // data method, at most.
+        Upload::Registers upload;
+        std::memcpy(&upload, fs.registers.data() + KEPLER_COMPUTE_REG_INDEX(upload),
+                    sizeof(upload));
+        const bool linear = (fs.registers[KEPLER_COMPUTE_REG_INDEX(exec_upload)] & 1) != 0;
+        const auto range = Upload::UploadedRange(upload, linear);
+        split.NoteWrite(memory_manager, range.address, range.size);
+        break;
+    }
+    case 0xae:
+    case 0xaf:
+    case 0xb0:
+        if (SignalsQmd(method, argument)) {
+            GetFrontQmd().Signal(split, FrontQmdMemory{memory_manager},
+                                 GPUVAddr{fs.registers[0xad]} << 8, argument, nullptr);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs, u32 control,
+                                    bool from_macro) {
+    // SET_REPORT_SEMAPHORE_D was sent: what ProcessNativeReportSemaphore will write on the back.
+    const u32 operation = control & 3;
+    if (operation != 0 && operation != 2) {
+        return;
+    }
+    const GPUVAddr address =
+        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    VideoCommon::Nx2AcquireStats::NoteRelease(
+        *device, VideoCommon::Nx2AcquireStats::Releaser::ReportCompute);
+    // A reduction combines the payload with the word's value then. The front knows that value
+    // when no compute or copy work sent since it may write the word (QMD releases): from the last
+    // release sent to the word if it is known, or from memory if nothing queued may change it.
+    // A macro's own launches count as work only after it ran (DmaPusher::NoteWriter).
+    const bool reduction = ((control >> 3) & 1) != 0;
+    if (reduction) {
+        const u32 payload = fs.registers[0x6c2];
+        const u32 op = (control >> 9) & 7;
+        std::optional<u32> base;
+        if (!from_macro) {
+            // A fenced release lands once its fence ran, before or after the reduction.
+            if (const auto queued = split.QueuedSemaphoreWriteAt(*device)) {
+                if (queued->known && !queued->at_least && !queued->fenced &&
+                    queued->position >= split.LastWriterPosition()) {
+                    base = queued->payload;
+                }
+            } else if (!split.WritersPending() && !Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+                base = memory_manager.Read<u32>(address);
+            }
+        }
+        split.NoteSemaphoreWrite(*device, base ? ReduceSemaphore(op, false, *base, payload) : 0,
+                                 base.has_value());
+        return;
+    }
+    // One word: a fence-flagged report, which lands once its fence ran. Else a payload report
+    // with a timestamp, written as the back runs it.
+    const bool one_word = ((control >> 28) & 1) != 0;
+    const auto landing =
+        one_word ? VideoCommon::GpuSplit::Landing::Fenced : VideoCommon::GpuSplit::Landing::AtRun;
+    split.NoteSemaphoreWrite(*device, fs.registers[0x6c2], true, false, landing);
+    if (!one_word) {
+        // 64 bits (a timestamp follows).
+        split.NoteSemaphoreWrite(*device + 4, 0, true, false, landing);
+    }
+}
+
+// LOAD_INLINE_QMD_DATA's last word (ProcessNativeMethod): the back writes the inline QMD to its
+// address and launches it, unless the QMD waits for a PCAS to schedule it.
+void KeplerCompute::FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                   u32 last_word) {
+    const GPUVAddr address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+    if (!memory_manager.IsFullyMappedRange(address, 256)) {
+        // The back writes nothing either, unless a change of the mappings still queued changes
+        // that.
+        if (!split.Ran(split.LastMappingChange())) {
+            GetFrontQmd().Lose();
+            split.NoteUnplacedWrite();
+            split.TagUnplaced(VideoCommon::UnplacedKind::InlineQmd); // TEST
+        }
+        return;
+    }
+    split.NoteWrite(memory_manager, address, 256);
+    // The words the back writes (registers 0xc8 to 0x107).
+    NativeQmdScheduler::Descriptor qmd;
+    std::memcpy(qmd.data(), fs.registers.data() + 0xc8, sizeof(qmd));
+    qmd[63] = last_word;
+    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+        GetFrontQmd().NoteInlineWrite(split, *device, qmd);
+    }
+    if ((fs.registers[0xa7] & (1U << 24)) != 0 || (fs.registers[0xcc] & (1U << 12)) == 0) {
+        GetFrontQmd().Signal(split, FrontQmdMemory{memory_manager}, address, 3, &qmd);
+    }
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1800,12 +2207,66 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
         return;
     }
-    if (method < fs.registers.size()) {
-        for (u32 i = 0; i < amount; ++i) {
-            FrontApply(fs, method, base_start[i]);
+    if (method >= fs.registers.size()) {
+        split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
+                          FrontWrites(method));
+        split.TagUnplaced(VideoCommon::UnplacedKind::Engine); // TEST
+        return;
+    }
+    for (u32 i = 0; i < amount; ++i) {
+        FrontApply(fs, method, base_start[i]);
+    }
+    if (IsQmdMethod(method)) {
+        GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
+    }
+    {
+        const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
+        split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
+                          FrontWrites(method));
+        // The back runs them one by one; what they write is the back's once it ran them all.
+        // Each upload data word may write the upload's range: once covers them.
+        const u32 notes =
+            method == KEPLER_COMPUTE_REG_INDEX(data_upload) ? (std::min)(amount, 1U) : amount;
+        for (u32 i = 0; i < notes; ++i) {
+            FrontNoteWrites(split, fs, method, base_start[i], false);
         }
     }
-    split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    FrontQmdCheck(split);
+}
+
+bool KeplerCompute::FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method, u32 count,
+                                       u32 slot) {
+    if (!native_mode || native_data_ram == nullptr) {
+        return false;
+    }
+    auto& fs = Front(split);
+    if (fs.executing_macro || !fs.parameters.empty()) {
+        return false; // Not a call's first parameter
+    }
+    if (!list_front) {
+        list_front = std::make_unique<Nx2ListIndirect::ComputeFront>();
+    }
+    const auto positions = FrontMacroPositions(fs);
+    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
+    const auto& macro = FrontMacroEngine(fs);
+    const auto no_emit = [](u32, u32) { return false; };
+    std::vector<u32> no_params;
+    ListCallContext<decltype(no_emit)> context{macro.native_code,
+                                               macro.native_code_generation,
+                                               start,
+                                               no_params,
+                                               std::span<u32>{*native_data_ram},
+                                               fs.registers,
+                                               fs.upload,
+                                               split,
+                                               memory_manager,
+                                               rasterizer,
+                                               this,
+                                               fs.registers,
+                                               native_registers,
+                                               no_emit};
+    return list_front->PrepareCall(context, Nx2ListIndirect::GetChannel(native_data_ram), slot,
+                                   count);
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1826,9 +2287,45 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return false;
         }
         FrontApply(fs, address, value);
-        split.MacroWrite(this, address, value);
+        if (IsQmdMethod(address)) {
+            GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
+        }
+        {
+            const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(address)};
+            split.MacroWrite(this, address, value, FrontWrites(address));
+            FrontNoteWrites(split, fs, address, value, true);
+        }
+        FrontQmdCheck(split);
         return true;
     };
+    if (list_front && native_data_ram != nullptr) {
+        // GPU-written list words among the call's parameters or within its reach: a tagged run
+        // that leaves them to the back, or the words themselves first (Nx2ListIndirect).
+        ListCallContext<decltype(emit)> context{macro.native_code,
+                                                macro.native_code_generation,
+                                                start,
+                                                fs.parameters,
+                                                std::span<u32>{*native_data_ram},
+                                                fs.registers,
+                                                fs.upload,
+                                                split,
+                                                memory_manager,
+                                                rasterizer,
+                                                this,
+                                                fs.registers,
+                                                native_registers,
+                                                emit};
+        bool concretized{};
+        Nx2ListIndirect::Reason reason{};
+        if (list_front->Run(context, Nx2ListIndirect::GetChannel(native_data_ram), concretized,
+                            reason)) {
+            fs.parameters.clear();
+            return;
+        }
+        if (concretized) {
+            Nx2ListIndirect::Stats::NoteConcretized(reason); // TEST
+        }
+    }
 #ifdef ARCHITECTURE_x86_64
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
