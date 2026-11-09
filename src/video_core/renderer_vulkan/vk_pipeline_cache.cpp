@@ -1716,10 +1716,12 @@ size_t PrecacheThreads() {
 
 bool ComputeNoInline();
 
-/// Whether shared shader functions are built as calls (compute bit 0, graphics bit 1), for the
-/// precache markers: the SPIR-V the driver compiled differs between the two modes.
+/// Whether shared shader functions are built as calls (compute bit 0, graphics bit 1) and whether
+/// Z32 draws get DLSS object motion (bit 2), for the precache markers: the SPIR-V the driver
+/// compiled differs between the modes.
 u32 NoInlineBits() {
-    return (ComputeNoInline() ? 1U : 0U) | (GraphicsNoInline() ? 2U : 0U);
+    return (ComputeNoInline() ? 1U : 0U) | (GraphicsNoInline() ? 2U : 0U) |
+           (VideoCommon::OotDlss::ObjectMotionRequested() ? 4U : 0U);
 }
 } // Anonymous namespace
 
@@ -3003,11 +3005,16 @@ std::optional<PipelineCache::GraphicsShaders> PipelineCache::BuildGraphicsShader
     const bool mesh_shadow = mesh_motion == 's';
     const bool oot_z32 = translation_key.oot_motion;
     const char* oot_reject = nullptr;
+    // The warm-up builds the pre-rasterization and fragment libraries of its entries on their own,
+    // in the form a Z32 draw gives them. The partner stage's checks are left out, and a fragment
+    // program alone takes the two highest varyings it doesn't read as the ones its vertex stage
+    // leaves free.
+    const bool has_fragment = key.unique_hashes[5] != 0;
     if (oot_z32) {
-        oot_reject = translation_key.xfb_requested       ? "transform feedback"
-                     : key.unique_hashes[5] == 0         ? "no fragment stage"
-                     : layer_source_program != nullptr   ? "layer emulation"
-                     : mesh_emulation.has_value()          ? "mesh emulation"
+        oot_reject = translation_key.xfb_requested               ? "transform feedback"
+                     : !has_fragment && !libraries_only          ? "no fragment stage"
+                     : layer_source_program != nullptr           ? "layer emulation"
+                     : mesh_emulation.has_value()                ? "mesh emulation"
                      : !device.IsExtShaderAtomicInt64Supported() || !profile.support_int64
                          ? "no 64-bit atomics"
                          : nullptr;
@@ -3033,17 +3040,21 @@ std::optional<PipelineCache::GraphicsShaders> PipelineCache::BuildGraphicsShader
                 shape_ok = false;
             }
         }
-        Shader::Info& fragment = programs[5].info;
-        if (shape_ok && geometry != 0 && programs[5].stage == Shader::Stage::Fragment) {
+        Shader::Info* const vertex = geometry != 0 ? &programs[geometry].info : nullptr;
+        Shader::Info* const fragment =
+            has_fragment && programs[5].stage == Shader::Stage::Fragment ? &programs[5].info
+                                                                         : nullptr;
+        const bool alone = libraries_only && (vertex == nullptr) != (fragment == nullptr);
+        if (shape_ok && ((vertex != nullptr && fragment != nullptr) || alone)) {
             oot_reject = nullptr;
-            Shader::IR::Program& source = programs[geometry];
-            Shader::Info& vertex = programs[geometry].info;
-            const bool mesh = vertex.is_mesh;
+            const bool mesh = vertex != nullptr && vertex->is_mesh;
             std::bitset<Shader::IR::NUM_GENERICS> used{};
             for (u32 location = 0; location < Shader::IR::NUM_GENERICS; ++location) {
-                used[location] = vertex.stores.Generic(location);
+                used[location] = vertex != nullptr ? vertex->stores.Generic(location)
+                                                   : fragment->loads.Generic(location);
             }
             if (mesh) {
+                const Shader::IR::Program& source = programs[geometry];
                 for (const auto& lines : {source.mesh.vertex_lines, source.mesh.primitive_lines}) {
                     for (const u32 line : lines) {
                         const auto attribute = static_cast<Shader::IR::Attribute>(line);
@@ -3060,53 +3071,65 @@ std::optional<PipelineCache::GraphicsShaders> PipelineCache::BuildGraphicsShader
                     free[found++] = location;
                 }
             }
-            const auto fits_motion = [&](const Shader::Info& info) {
-                return Shader::NumDescriptors(info.storage_buffers_descriptors) + 1 <=
-                           device.GetMaxPerStageDescriptorStorageBuffers() &&
-                       NumDescriptorEntries(info) + 1 <= device.GetMaxPerStageResources();
+            const auto fits_motion = [&](const Shader::Info* info) {
+                return info == nullptr ||
+                       (Shader::NumDescriptors(info->storage_buffers_descriptors) + 1 <=
+                            device.GetMaxPerStageDescriptorStorageBuffers() &&
+                        NumDescriptorEntries(*info) + 1 <= device.GetMaxPerStageResources());
             };
-            oot_reject = found < 2                      ? "no two free varyings"
-                         : vertex.uses_render_area || fragment.uses_render_area
-                             ? "uses the render area"
-                         : fragment.stores_frag_depth   ? "writes its own depth"
-                         : vertex.stores.Legacy() || fragment.loads.Legacy()
-                             ? "legacy attributes"
-                         : !fits_motion(vertex) || !fits_motion(fragment)
-                             ? "motion buffer exceeds stage limits"
-                             : nullptr;
+            oot_reject =
+                found < 2 ? "no two free varyings"
+                : (vertex != nullptr && vertex->uses_render_area) ||
+                        (fragment != nullptr && fragment->uses_render_area)
+                    ? "uses the render area"
+                : fragment != nullptr && fragment->stores_frag_depth ? "writes its own depth"
+                : (vertex != nullptr && vertex->stores.Legacy()) ||
+                        (fragment != nullptr && fragment->loads.Legacy())
+                    ? "legacy attributes"
+                : !fits_motion(vertex) || !fits_motion(fragment)
+                    ? "motion buffer exceeds stage limits"
+                    : nullptr;
             if (oot_reject == nullptr && mesh && mesh_shadow &&
-                !Shader::Optimization::OotShadowPass(source)) {
+                !Shader::Optimization::OotShadowPass(programs[geometry])) {
                 oot_reject = "mesh program the shadow pass can't evaluate";
             }
             if (oot_reject == nullptr) {
-                for (Shader::Info* info : {&vertex, &fragment}) {
-                    info->oot_motion.location_current = free[0];
-                    info->oot_motion.location_previous = free[1];
+                for (Shader::Info* const info : {vertex, fragment}) {
+                    if (info != nullptr) {
+                        info->oot_motion.location_current = free[0];
+                        info->oot_motion.location_previous = free[1];
+                    }
                 }
-                vertex.oot_motion.history = true;
-                vertex.oot_motion.mesh_max_vertices = mesh ? source.mesh.max_vertices : 0;
-                fragment.oot_motion.image = true;
-                fragment.uses_int64 = true;
-                fragment.uses_int64_bit_atomics = true;
-                const auto written = [](const auto& descriptors) {
-                    return std::ranges::any_of(descriptors,
-                                               [](const auto& desc) { return desc.is_written; });
-                };
-                fragment.oot_motion.early_tests =
-                    !fragment.uses_demote_to_helper_invocation && !fragment.stores_global_memory &&
-                    !written(fragment.storage_buffers_descriptors) &&
-                    !written(fragment.image_descriptors) &&
-                    !written(fragment.image_buffer_descriptors);
+                if (vertex != nullptr) {
+                    vertex->oot_motion.history = true;
+                    vertex->oot_motion.mesh_max_vertices =
+                        mesh ? programs[geometry].mesh.max_vertices : 0;
+                }
+                if (fragment != nullptr) {
+                    fragment->oot_motion.image = true;
+                    fragment->uses_int64 = true;
+                    fragment->uses_int64_bit_atomics = true;
+                    const auto written = [](const auto& descriptors) {
+                        return std::ranges::any_of(
+                            descriptors, [](const auto& desc) { return desc.is_written; });
+                    };
+                    fragment->oot_motion.early_tests =
+                        !fragment->uses_demote_to_helper_invocation &&
+                        !fragment->stores_global_memory &&
+                        !written(fragment->storage_buffers_descriptors) &&
+                        !written(fragment->image_descriptors) &&
+                        !written(fragment->image_buffer_descriptors);
+                }
                 static std::array<std::atomic<u32>, 2> logged{};
-                if (logged[mesh].fetch_add(1, std::memory_order_relaxed) < 8) {
+                if (!alone && logged[mesh].fetch_add(1, std::memory_order_relaxed) < 8) {
                     LOG_INFO(Render_Vulkan,
                              "OoT DLSS: object motion in pipeline {}={:016x} fs={:016x} "
                              "(varyings at {} and {}{})",
                              mesh ? "mesh" : "vs", key.unique_hashes[geometry],
                              key.unique_hashes[5], free[0], free[1],
-                             vertex.oot_motion.shadow
+                             vertex->oot_motion.shadow
                                  ? fmt::format(", shadow of {} constant buffer words",
-                                               vertex.oot_motion.shadow_words)
+                                               vertex->oot_motion.shadow_words)
                                  : std::string{});
                 }
             }

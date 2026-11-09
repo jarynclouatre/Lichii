@@ -89,7 +89,9 @@ std::shared_ptr<const GplLibrary> GraphicsPipelineLibraryCache::GetOrCreate(
         total_libraries.fetch_add(1, std::memory_order_relaxed);
         build_ns[index].fetch_add(ns, std::memory_order_relaxed);
         StoreMax(build_max_ns[index], ns);
-        if (ns > 2'000'000 && logged_builds.fetch_add(1, std::memory_order_relaxed) < 400) {
+        // The warm-up's builds would use up the lines before the game draws.
+        if (!no_retain_on_thread && ns > 2'000'000 &&
+            logged_builds.fetch_add(1, std::memory_order_relaxed) < 4000) {
             LOG_INFO(Render_Vulkan, "Nx2Perf gpl: {} library {:016x} built in {:.1f} ms",
                      PART_NAMES[index], name, Ms(ns));
         }
