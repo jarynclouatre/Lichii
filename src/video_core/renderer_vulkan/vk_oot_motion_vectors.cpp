@@ -113,7 +113,8 @@ OotMotionVectors::OotMotionVectors(const Device& device_, MemoryAllocator& alloc
          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
         VK_SHADER_STAGE_COMPUTE_BIT);
     const std::array layouts{*descriptor_set_layout, *descriptor_set_layout,
                              *descriptor_set_layout, *descriptor_set_layout};
@@ -470,6 +471,8 @@ void OotMotionVectors::CreateImage(VkExtent2D size) {
             },
         });
     };
+    clean_image = colour_image(size);
+    clean_view = colour_view(*clean_image);
     // Last frame's colour for the motion check (1x1 stand-ins without it).
     const VkExtent2D history_size = CheckRequested() ? size : VkExtent2D{1, 1};
     for (size_t i = 0; i < history_images.size(); ++i) {
@@ -486,7 +489,7 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
                                        std::array<f32, 2> jitter, bool flip_y,
                                        VkBuffer object_pixels, VkImageView effects_view,
                                        f32 mask_gain, VkImageView fog_view, f32 fog_gain,
-                                       VkImageView color_view) {
+                                       VkImageView color_view, bool display_color) {
     if (!image || extent.width != size.width || extent.height != size.height) {
         if (image) {
             scheduler.Finish(); // the old image may still be read
@@ -531,7 +534,7 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
     const bool check = CheckRequested() && color_view != VK_NULL_HANDLE;
     const VkDescriptorImageInfo current_info{
         .sampler = *sampler,
-        .imageView = check ? color_view : depth_view,
+        .imageView = color_view != VK_NULL_HANDLE ? color_view : depth_view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
     const VkDescriptorImageInfo previous_info{
@@ -547,6 +550,11 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
     const VkDescriptorImageInfo mask_info{
         .sampler = VK_NULL_HANDLE,
         .imageView = *mask_view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const VkDescriptorImageInfo clean_info{
+        .sampler = VK_NULL_HANDLE,
+        .imageView = *clean_view,
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
     const std::array writes{
@@ -670,6 +678,18 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
             .pBufferInfo = nullptr,
             .pTexelBufferView = nullptr,
         },
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = set,
+            .dstBinding = 10,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &clean_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        },
     };
     device.GetLogical().UpdateDescriptorSets(writes, {});
 
@@ -683,7 +703,9 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
                         (DebugRequested() ? 4u : 0u) |
                         (effects_view != VK_NULL_HANDLE ? 8u : 0u) |
                         (fog_view != VK_NULL_HANDLE ? 16u : 0u) | (check ? 32u : 0u) |
-                        (check && history_valid ? 64u : 0u),
+                        (check && history_valid ? 64u : 0u) |
+                        (color_view != VK_NULL_HANDLE ? 128u : 0u) |
+                        (display_color ? 256u : 0u),
         .mask_gain = mask_gain,
         .fog_gain = fog_gain,
         .camera_deadzone = CameraDeadzone(),
@@ -696,6 +718,7 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
 
     const VkImage output_image = *image;
     const VkImage mask = *mask_image;
+    const VkImage clean = *clean_image;
     const VkImage history_a = *history_images[0];
     const VkImage history_b = *history_images[1];
     if (check) {
@@ -710,6 +733,8 @@ VkImageView OotMotionVectors::Generate(Scheduler& scheduler, VkImageView depth_v
             TransitionImageLayout(cmdbuf, output_image, VK_IMAGE_LAYOUT_GENERAL,
                                   VK_IMAGE_LAYOUT_UNDEFINED);
             TransitionImageLayout(cmdbuf, mask, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_IMAGE_LAYOUT_UNDEFINED);
+            TransitionImageLayout(cmdbuf, clean, VK_IMAGE_LAYOUT_GENERAL,
                                   VK_IMAGE_LAYOUT_UNDEFINED);
             TransitionImageLayout(cmdbuf, history_a, VK_IMAGE_LAYOUT_GENERAL,
                                   VK_IMAGE_LAYOUT_UNDEFINED);

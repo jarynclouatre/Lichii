@@ -41,6 +41,8 @@ layout (binding = 6) uniform sampler2D fog_texture;
 layout (binding = 7) uniform sampler2D current_color;
 layout (binding = 8) uniform sampler2D previous_color;
 layout (binding = 9, rgba16f) uniform writeonly image2D next_previous;
+// DLSS's colour input: this frame's colour without NaN or infinite values.
+layout (binding = 10, rgba16f) uniform writeonly image2D clean_color;
 
 layout (push_constant) uniform PushConstants {
     // Row-major: previous clip = reproject * current NDC (with w = 1).
@@ -52,7 +54,8 @@ layout (push_constant) uniform PushConstants {
     float flip_y;
     // Bit 0: read object motion. Bit 1: count statistics. Bit 2: debug view (red: the motion
     // length / 32 px; green: 0.6 where object motion is used, plus 0.3 where the depth is empty).
-    // Bit 3: effects_texture is bound (else the mask is 0).
+    // Bit 3: effects_texture is bound (else the mask is 0). Bit 7: write clean_color (bit 8:
+    // the colour is display referred).
     uint object_flags;
     // Effects layer brightness to mask value; bit 4 of the flags: fog_texture is bound.
     float mask_gain;
@@ -66,6 +69,16 @@ void main() {
     const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, ivec2(render_size)))) {
         return;
+    }
+    if ((object_flags & 128u) != 0u) {
+        // DLSS keeps a NaN or infinite pixel in its history and spreads it into white or black
+        // blocks (Kakariko Village).
+        vec3 color = texelFetch(current_color, pixel, 0).rgb;
+        if (any(isnan(color)) || any(isinf(color))) {
+            color = vec3(0.0);
+        }
+        color = clamp(color, vec3(0.0), vec3((object_flags & 256u) != 0u ? 1.0 : 65504.0));
+        imageStore(clean_color, pixel, vec4(color, 1.0));
     }
     const vec2 uv = (vec2(pixel) + 0.5 - jitter) / render_size;
     float mask = 0.0;
@@ -158,6 +171,9 @@ void main() {
                    vec4(length(motion * render_size) / 32.0,
                         (used_object ? 0.6 : 0.0) + (depth >= 1.0 ? 0.3 : 0.0), 0.0, 0.0));
         return;
+    }
+    if (any(isnan(motion)) || any(isinf(motion))) {
+        motion = vec2(0.0);
     }
     imageStore(motion_vectors, pixel, vec4(motion, 0.0, 0.0));
     // Bit 5: the motion check (bit 6: last frame's colour is valid).

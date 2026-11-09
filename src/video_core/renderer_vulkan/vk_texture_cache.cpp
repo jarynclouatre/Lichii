@@ -2118,7 +2118,7 @@ bool TextureCacheRuntime::OotDlss(Framebuffer* dst_framebuffer, ImageView& input
         scheduler, depth.DepthView(), size, reproject, jitter, flip_y, object_pixels,
         particles_after ? VK_NULL_HANDLE : effects_view, ::VideoCommon::OotDlss::MaskGain(),
         fog_view, ::VideoCommon::OotDlss::FogMaskGain(),
-        input_color.Handle(Shader::TextureType::Color2D));
+        input_color.Handle(Shader::TextureType::Color2D), !hdr);
     const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
         return StreamlineDlssUpscaler::Image{
             .view = handle,
@@ -2139,8 +2139,19 @@ bool TextureCacheRuntime::OotDlss(Framebuffer* dst_framebuffer, ImageView& input
     bool upscaled{};
     try {
         upscaled = dlss_upscaler->Upscale({
-            .color = image(input_color, input_color.Handle(Shader::TextureType::Color2D),
-                           VK_IMAGE_ASPECT_COLOR_BIT),
+            .color{
+                .view = oot_motion_vectors->CleanColorView(),
+                .image = oot_motion_vectors->CleanColorImage(),
+                .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                .range{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .barrier_aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+            },
             .depth = image(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
             .motion_vectors{
                 .view = motion_view,

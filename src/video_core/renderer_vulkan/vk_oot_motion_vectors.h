@@ -30,7 +30,7 @@ public:
                          const std::array<f32, 16>& reproject, std::array<f32, 2> jitter,
                          bool flip_y, VkBuffer object_pixels, VkImageView effects_view = {},
                          f32 mask_gain = 0.0f, VkImageView fog_view = {}, f32 fog_gain = 0.0f,
-                         VkImageView color_view = {});
+                         VkImageView color_view = {}, bool display_color = false);
 
     /// Copies an image (GENERAL layout) into copy `which` (0: the scene colour before the
     /// particles, 1: with them, 2: the tonemapped image with them), or with `restore` back.
@@ -55,6 +55,14 @@ public:
     [[nodiscard]] VkImageView MaskView() const noexcept {
         return *mask_view;
     }
+    /// `color_view` without NaN or infinite values (RGBA16F, GENERAL layout), written with the
+    /// motion when Generate was given one.
+    [[nodiscard]] VkImage CleanColorImage() const noexcept {
+        return *clean_image;
+    }
+    [[nodiscard]] VkImageView CleanColorView() const noexcept {
+        return *clean_view;
+    }
 
 private:
     static constexpr u32 SetCount = 4;
@@ -78,6 +86,8 @@ private:
     vk::ImageView view;
     vk::Image mask_image;
     vk::ImageView mask_view;
+    vk::Image clean_image;
+    vk::ImageView clean_view;
     // EDEN_OOT_MOTION_CHECK: this frame's and last frame's colour, swapped every evaluation.
     std::array<vk::Image, 3> scene_images;
     std::array<vk::ImageView, 3> scene_views;
