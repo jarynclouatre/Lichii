@@ -45,6 +45,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
+#include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
@@ -297,6 +298,19 @@ public:
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
     [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
+
+    /// Whether sampling the views now needs PrepareImageView: an image with an upload pending or
+    /// a newer alias to copy in (fast draw delta draws keep their views and prepare none).
+    [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
+        return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
+    }
+
+    /// EDEN_NX2_TEXTURE_MEMO_VERIFY: PrepareImage adds the images it is asked to prepare to `log`
+    /// (nullptr stops it) and, with `dry`, does nothing else.
+    void LogPrepares(std::vector<ImageId>* log, bool dry) noexcept {
+        prepare_log = log;
+        prepare_log_dry = dry;
+    }
 
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
@@ -647,6 +661,8 @@ private:
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    std::vector<ImageId>* prepare_log{}; ///< LogPrepares
+    bool prepare_log_dry{};
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;

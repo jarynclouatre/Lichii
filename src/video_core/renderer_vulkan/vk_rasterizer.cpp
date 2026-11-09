@@ -510,11 +510,36 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
             }
         }
     }
+    taken_draw = draw;
     return draw.pipeline;
 }
 
+bool RasterizerVulkan::DeltaStillHolds(u64 serial, u64 map_serial) {
+    const auto full = [&](FullDraw reason) {
+        ++fast_draw_stats.full[static_cast<size_t>(reason)];
+        return false;
+    };
+    // TakeReusableDraw ran before the caches were locked, while other threads could still write,
+    // unmap or delete what the delta draw keeps.
+    if (taken_draw.serial != serial || taken_draw.map_serial != map_serial) {
+        return full(FullDraw::StateChanged);
+    }
+    if (taken_draw.tick != scheduler.CurrentTick()) {
+        return full(FullDraw::Submitted);
+    }
+    if (taken_draw.render_pass != scheduler.RenderPassSerial() || !scheduler.IsRenderPassActive()) {
+        return full(FullDraw::RenderPass);
+    }
+    // A delta draw prepares none of the images it samples: one with an upload pending or a newer
+    // alias to copy in (a render target aliasing it, written by the draw before) needs Configure.
+    if (taken_draw.pipeline->DeltaImagesChange()) {
+        return full(FullDraw::SampledImages);
+    }
+    return true;
+}
+
 void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed,
-                                        bool is_indirect) {
+                                        bool is_indirect, u64 serial, u64 map_serial) {
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto topology = draw_state.topology;
     const auto ineligible = [&]() -> std::optional<Ineligible> {
@@ -541,8 +566,8 @@ void RasterizerVulkan::NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_inde
     reusable_draw = ReusableDraw{
         .pipeline = pipeline,
         .maxwell3d = maxwell3d,
-        .serial = VideoCommon::Nx2FastDraw::Serial(),
-        .map_serial = gpu_memory->MapSerial(),
+        .serial = serial,
+        .map_serial = map_serial,
         .tick = scheduler.CurrentTick(),
         .render_pass = scheduler.RenderPassSerial(),
         .topology = topology,
@@ -573,12 +598,12 @@ void RasterizerVulkan::ReportFastDraws() {
              "Fast draw per second: {:.0f} delta | full: {:.0f} after an ineligible draw, {:.0f} "
              "different kind, {:.0f} state changed, {:.0f} after a submit, {:.0f} render pass or "
              "pipeline changed, {:.0f} pipeline takes no delta draws, {:.0f} handle buffer bound, "
-             "{:.0f} handle data written",
+             "{:.0f} handle data written, {:.0f} sampled image to prepare",
              static_cast<double>(stats.delta) / seconds, per_second(FullDraw::NoCandidate),
              per_second(FullDraw::Kind), per_second(FullDraw::StateChanged),
              per_second(FullDraw::Submitted), per_second(FullDraw::RenderPass),
              per_second(FullDraw::DeltaPipeline), per_second(FullDraw::HandleBind),
-             per_second(FullDraw::HandleData));
+             per_second(FullDraw::HandleData), per_second(FullDraw::SampledImages));
     static constexpr std::array<const char*, static_cast<size_t>(Ineligible::Count)>
         ineligible_names{"indirect",       "mesh",          "not built",     "writes images",
                          "transform feedback", "inline index", "quads",       "repacked vertices",
@@ -1165,6 +1190,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         mesh_emulation_vertices_per_group = pipeline->MeshEmulationVerticesPerGroup();
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    // What the next draw's TakeReusableDraw compares with, read once the caches are locked: a
+    // break from here on, this draw's own resolve included, ends the delta chain.
+    const u64 draw_serial = FastDraw::Serial();
+    const u64 draw_map_serial = gpu_memory->MapSerial();
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     const u32 repack_dirty = buffer_cache_runtime.SetVertexRepackLayout(
@@ -1180,7 +1209,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         }
     }
     setup_scope.reset();
-    const DrawPath path = delta_pipeline && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
+    const bool delta_holds =
+        delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
+    const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
     if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
             report_failure("configure failed");
@@ -1273,7 +1304,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     submitted = true;
     buffer_cache.NoteWorkRecorded(false);
     if (fast_draw_on) {
-        NoteResolvedDraw(pipeline, is_indexed, is_indirect);
+        NoteResolvedDraw(pipeline, is_indexed, is_indirect, draw_serial, draw_map_serial);
         const size_t index = static_cast<size_t>(path);
         fast_draw_stats.prepare_ns[index] += Profile::Now() - fast_draw_start;
         ++fast_draw_stats.prepare_draws[index];
@@ -2498,11 +2529,27 @@ bool RasterizerVulkan::IsGpuTickDone(u64 tick) {
     if (scheduler.IsFree(tick)) {
         return true;
     }
+    // The GPU thread polls a channel suspended on a list copy back to back (it spins for 500 us
+    // before it sleeps): ~190,000 polls a second on Windows. Each asked the back to submit (a
+    // futex wake, a kernel call on Windows) and the driver for the semaphore's value (also a
+    // kernel call there). Both are needed far less often than that.
+    const auto now = std::chrono::steady_clock::now();
     // A deferred submission (Scheduler::DeferFlush) is only made by the split's back: ask it to
-    // submit, or the tick never completes while the front polls.
-    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active()) {
+    // submit, or the tick never completes while the front polls. Once per tick is enough (the
+    // hook submits everything deferred, so also every earlier tick); again after a millisecond
+    // in case it raced.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active() &&
+        (tick > poll_submit_requested_tick ||
+         now - poll_submit_requested_at > std::chrono::milliseconds{1})) {
         VideoCommon::GpuSplit::Get().RequestIdleHook();
+        poll_submit_requested_tick = (std::max)(poll_submit_requested_tick, tick);
+        poll_submit_requested_at = now;
     }
+    // The GPU's progress, from the driver at most every 20 us (a copy takes longer than that).
+    if (now - poll_refreshed_at < std::chrono::microseconds{20}) {
+        return false;
+    }
+    poll_refreshed_at = now;
     scheduler.GetMasterSemaphore().Refresh();
     return scheduler.IsFree(tick);
 }

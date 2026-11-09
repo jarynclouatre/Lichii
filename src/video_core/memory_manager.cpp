@@ -982,8 +982,8 @@ boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
     if (IsWithinGPUAddressRange(gpu_addr)) {
-        GetSubmappedRangeImpl<false>(gpu_addr, (std::min)(size, address_space_size - gpu_addr),
-                                     result);
+        GetSubmappedRangeImpl<false>(
+            gpu_addr, (std::min<u64>)(size, address_space_size - gpu_addr), result);
     }
     return result;
 }

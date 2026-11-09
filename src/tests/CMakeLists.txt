@@ -54,6 +54,7 @@ add_executable(tests
     video_core/ampere_logged_textures.cpp
     video_core/native_texture_header_index.cpp
     video_core/texture_alias_ticks.cpp
+    video_core/sampled_views.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
@@ -126,6 +127,7 @@ add_executable(tests
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
     common/bit_field.cpp
+    common/bit_util.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/core_pinning.cpp

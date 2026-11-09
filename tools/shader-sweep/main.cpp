@@ -1000,6 +1000,7 @@ int main(int argc, char** argv) {
             host.support_conditional_barrier = true;
             host.support_viewport_index_layer = true;
             host.support_geometry_shader_passthrough = true;
+            host.support_handle_table_arrays = true;
             host.ApplyDescriptorLimitPolicy();
             auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, source, cfg, host);
             auto info = runtime;
@@ -1020,6 +1021,8 @@ int main(int argc, char** argv) {
             profile.max_user_clip_distances = 8;
             profile.max_subgroup_size = 32;
             profile.support_typeless_image_loads = true;
+            // Handle table arrays are indexed per invocation, as with Vulkan.
+            profile.support_sampled_image_array_nonuniform_indexing = true;
             Shader::Backend::Bindings bindings{};
             return Shader::Backend::SPIRV::EmitSPIRV(profile, info, program, bindings);
         };

@@ -417,6 +417,10 @@ public:
         return delta_mismatch;
     }
 
+    /// Whether an image the kept views sample has an upload pending or a newer alias to copy in:
+    /// ConfigureDelta prepares none, Configure does.
+    [[nodiscard]] bool DeltaImagesChange() const noexcept;
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };

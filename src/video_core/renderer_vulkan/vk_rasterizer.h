@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -208,6 +209,11 @@ private:
     static constexpr size_t MAX_IMAGE_VIEWS = MAX_TEXTURES + MAX_IMAGES;
 
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
+
+    /// IsGpuTickDone's rate limits (the GPU thread that polls suspended channels only).
+    u64 poll_submit_requested_tick{};
+    std::chrono::steady_clock::time_point poll_submit_requested_at{};
+    std::chrono::steady_clock::time_point poll_refreshed_at{};
 
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
@@ -418,6 +424,7 @@ private:
         DeltaPipeline,
         HandleBind,
         HandleData,
+        SampledImages,
         Count,
     };
     /// Why a recorded draw can't be followed by a delta draw.
@@ -458,9 +465,14 @@ private:
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
     /// the remembered draw either way: only a recorded draw remembers one again.
     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
-    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect);
+    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
+    /// map_serial as read then), and the images it samples need no preparing.
+    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
+                          u64 map_serial);
     void ReportFastDraws();
     ReusableDraw reusable_draw;
+    ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
                Maxwell::MaxShaderStage>

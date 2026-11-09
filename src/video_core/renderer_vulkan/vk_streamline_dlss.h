@@ -105,6 +105,7 @@ private:
     bool applied_auto_exposure{};
     vk::Sampler point_sampler;
     std::atomic<bool> failed{};
+    std::atomic<bool> vram_warned{};
 };
 
 } // namespace Vulkan

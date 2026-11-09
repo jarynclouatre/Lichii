@@ -676,8 +676,16 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         if (blacklist) {
             has_blacklisted = false;
         }
+        const ImageViewInOut* previous{};
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(view.index, compute);
+            // An element repeating the one before (a handle table holding one shadow map in
+            // many elements, say) is the same view: visiting it again only prepares it again.
+            // Not once this pass has deleted image views (scaling an image down below does):
+            // that view may have gone with them.
+            view.id = previous != nullptr && previous->index == view.index && !has_deleted_images
+                          ? previous->id
+                          : VisitImageView(view.index, compute);
+            previous = &view;
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -731,10 +739,7 @@ bool TextureCache<P>::ResolveMemoizedTextures(SampledTextureMemo& memo,
         const SampledTextureMemo::Entry& entry = memo.entries[i];
         views[i] = ImageViewInOut{.index = entry.view_index, .blacklist = false, .id = entry.view};
         samplers[i] = entry.sampler;
-        // As in VisitImageView: the null image has nothing to upload and no valid format.
-        if (entry.view != NULL_IMAGE_VIEW_ID) {
-            PrepareImageView(entry.view, false, false);
-        }
+        PrepareImageView(entry.view, false, false);
     }
     if (has_deleted_images) {
         // Preparing an image deleted others: the full path resolves the views again.
@@ -2825,6 +2830,8 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::InvalidateScale(Image& image) {
+    // Its views are deleted: a fast draw delta draw keeping one must not follow.
+    VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
     if (image.scale_tick <= frame_tick) {
         image.scale_tick = frame_tick + 1;
     }
@@ -4374,6 +4381,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
+    if (prepare_log != nullptr) {
+        prepare_log->push_back(image_id);
+        if (prepare_log_dry) {
+            return;
+        }
+    }
     Image& image = slot_images[image_id];
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
@@ -4429,14 +4442,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
 template <class P>
 void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modification,
                                        bool invalidate) {
-    if (!image_view_id) {
+    if (!PreparesImage(slot_image_views, image_view_id)) {
         return;
     }
-    const ImageViewBase& image_view = slot_image_views[image_view_id];
-    if (image_view.IsBuffer()) {
-        return;
-    }
-    PrepareImage(image_view.image_id, is_modification, invalidate);
+    PrepareImage(slot_image_views[image_view_id].image_id, is_modification, invalidate);
 }
 
 template <class P>

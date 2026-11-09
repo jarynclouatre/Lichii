@@ -78,6 +78,8 @@ public:
                     } else {
                         task();
                     }
+                    // Release captures before waiters can observe completed work.
+                    task = Task{};
                     ++work_done;
                 }
             }
